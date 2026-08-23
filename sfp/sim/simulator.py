@@ -193,8 +193,19 @@ def simulate(
         # --- log ----------------------------------------------------------
         record = {"time_s": t}
         record.update(w)
+        # Reuse the evaluation the bus already performed at this exact state and
+        # dispatch rather than repeating the most expensive call in the loop.
+        # Those outputs come first because the dispatch, applied next, is
+        # authoritative wherever the two overlap.
+        record.update(dispatch.plant_outputs)
         record.update(dispatch.as_dict())
-        record.update(plant.outputs(t, x, u, w))
+        # The bus evaluates the plant *before* it knows how much PV will be
+        # curtailed, so it passes a curtail fraction of zero. Every PV-side
+        # quantity in `plant_outputs` is therefore provisional and must be
+        # replaced with the settled dispatch values.
+        record["pv_delivered_W"] = dispatch.pv_used_W
+        record["pv_power_W"] = -dispatch.pv_used_W
+        record["power.pv"] = -dispatch.pv_used_W
         record.update({f"state.{n}": v for n, v in zip(plant.state_names(), x)})
         record.update(controller.diagnostics())
         records.append(record)

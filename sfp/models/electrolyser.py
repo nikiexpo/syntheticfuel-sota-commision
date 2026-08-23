@@ -266,12 +266,28 @@ class Electrolyser(Subsystem):
         return float(0.5 * (low + high))
 
     def best_efficiency_fraction(self, x: np.ndarray | None = None) -> float:
-        """Load fraction maximising total LHV efficiency -- the part-load peak."""
+        """Load fraction maximising total LHV efficiency -- the part-load peak.
+
+        Cached for the nominal state, because it is a property of the
+        polarisation curve and the auxiliary load rather than of the moment. A
+        controller that queries it every step was otherwise running a 200-point
+        scan 288 times per simulated day, which was the single largest
+        algorithmic cost in the closed loop.
+
+        Passing an explicit `x` bypasses the cache, since the peak does move
+        slightly with stack temperature and degradation.
+        """
+        if x is None:
+            cached = getattr(self, "_best_fraction_cache", None)
+            if cached is not None:
+                return cached
         state = np.array([self.p.temperature_setpoint_K, 0.0]) if x is None else x
         fractions = np.linspace(self.p.current_density_min_fraction, 1.0, 200)
-        best, best_eta = fractions[0], -np.inf
+        best, best_eta = float(fractions[0]), -np.inf
         for frac in fractions:
             eta = float(self.efficiency_lhv(state, np.array([frac, 1.0])))
             if eta > best_eta:
                 best, best_eta = float(frac), eta
+        if x is None:
+            self._best_fraction_cache = best
         return best

@@ -108,6 +108,9 @@ class Dispatch:
     enables: dict[str, float] = field(default_factory=dict)
     loads_W: dict[str, float] = field(default_factory=dict)
     total_load_W: float = 0.0
+    #: full plant outputs at this state and dispatch, reused by the simulator's
+    #: logging so the plant is not evaluated twice for identical arguments
+    plant_outputs: dict = field(default_factory=dict, repr=False)
 
     # diagnostics
     shed_W: float = 0.0
@@ -146,17 +149,27 @@ class Dispatch:
         return out
 
 
-def _plant_load_W(plant, t, x, setpoints, enables, w) -> tuple[float, dict[str, float]]:
+def _plant_load_W(plant, t, x, setpoints, enables, w):
     """Exact total plant load for a candidate dispatch, including the compressor.
 
     Evaluates the whole coupled plant rather than summing per-subsystem power
     curves, because some draws (the CO2 compressor most of all) follow reaction
     rates rather than commands.
+
+    Returns the total, the per-subsystem loads, and the full output dictionary.
+    The last of these is handed back so the simulator can log it instead of
+    evaluating the same plant, at the same state and inputs, a second time --
+    a full evaluation is the most expensive operation in the loop and there were
+    about seven of them per timestep.
     """
     u = _inputs_from(plant, setpoints, enables)
-    powers = plant.electrical_powers_W(t, x, u, w)
-    loads = {k: v for k, v in powers.items() if k not in NON_LOADS}
-    return float(sum(loads.values())), loads
+    outputs, _ = plant.evaluate(t, x, u, w)
+    loads = {
+        key: float(outputs[f"power.{key}"])
+        for key in plant.subsystems
+        if f"power.{key}" in outputs and key not in NON_LOADS
+    }
+    return float(sum(loads.values())), loads, outputs
 
 
 def _inputs_from(plant, setpoints, enables) -> dict[str, np.ndarray]:
@@ -265,8 +278,13 @@ def reconcile(
 
     # --- stage 3: exact total, then settle the supply side -----------------
     unserved_W = 0.0
+    # The evaluation below is the single most expensive call in the simulation
+    # loop, so it is done once per pass and its result carried forward rather
+    # than recomputed after the loop.
+    total_load, loads, plant_outputs = _plant_load_W(
+        plant, t, state, setpoints, enables, weather
+    )
     for _ in range(3):
-        total_load, loads = _plant_load_W(plant, t, state, setpoints, enables, weather)
         if total_load <= supply_ceiling + 1e-3:
             break
         # the uncommanded compressor pushed us over; shed the next subsystem
@@ -278,10 +296,10 @@ def reconcile(
                 break
         else:
             break
-    else:  # pragma: no cover - three passes always suffice in practice
-        pass
+        total_load, loads, plant_outputs = _plant_load_W(
+            plant, t, state, setpoints, enables, weather
+        )
 
-    total_load, loads = _plant_load_W(plant, t, state, setpoints, enables, weather)
     if total_load < 1e-3:
         total_load = 0.0
 
@@ -327,6 +345,7 @@ def reconcile(
         enables=enables,
         loads_W=loads,
         total_load_W=total_load,
+        plant_outputs=plant_outputs,
         shed_W=shed_W,
         charge_denied_W=charge_denied_W,
         unserved_W=unserved_W,

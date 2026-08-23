@@ -161,17 +161,32 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"Window    {args.days:.0f} days from day-of-year {args.start_day}")
     print(f"Weather   {weather.provenance}: {weather.source}\n")
 
-    for controller in controllers_for(names):
+    selected = controllers_for(names)
+    # measured: ~11 s per simulated day per controller on a laptop, plus plotting
+    estimate_s = 11.0 * args.days * len(selected) + 25.0
+    print(
+        f"Running {len(selected)} controller(s) over {args.days:.0f} days "
+        f"at dt={args.dt:.0f}s -- roughly {estimate_s:.0f}s total.\n"
+    )
+
+    for controller in selected:
         plant = build_plant(args.pv, args.battery, args.battery_power, args.calciner)
+        # Announce *before* simulating. A 10-day coupled run takes ~90 s, and
+        # printing the controller name only on completion made the CLI look hung.
+        print(f"--- {controller.name} " + "-" * (54 - len(controller.name)))
+        print("  simulating ...", end="", flush=True)
         result = simulate(plant, controller, weather, config, economics=economics)
         m = compute_metrics(result, economics)
         results.append(result)
         metrics.append(m)
-
-        print(f"--- {m.controller} " + "-" * (54 - len(m.controller)))
+        print("\r  ran in %.0fs%s" % (result.wall_time_s, " " * 14))
         print(f"  methane            {m.ch4_kg:10.1f} kg   ({m.ch4_kg_per_day:.1f} kg/day)")
+        print(f"  night-time share   {m.night_production_fraction:10.1%}")
         print(f"  utilisation        {m.utilisation:10.1%}")
-        print(f"  starts             {m.starts:10.1f}")
+        print(f"  CO2 captured       {m.co2_captured_kg:10.1f} kg")
+        print(f"  H2 produced        {m.h2_produced_kg:10.1f} kg   (vented {m.h2_vented_fraction:.1%})")
+        print(f"  water consumed     {m.water_consumed_kg:10.1f} kg")
+        print(f"  sorbent cycles     {m.sorbent_cycles:10.2f}   conversion {m.sorbent_conversion_start:.3f} -> {m.sorbent_conversion_end:.3f}")
         print(f"  PV available       {m.pv_available_kwh:10.0f} kWh")
         print(f"  PV curtailed       {m.pv_curtailed_kwh:10.0f} kWh  ({m.curtailment_fraction:.1%})")
         print(f"  inverter clipping  {m.pv_clipped_kwh:10.0f} kWh")
@@ -180,7 +195,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"  battery cycles     {m.battery_efc:10.2f} EFC   SoC {m.soc_min:.2f}-{m.soc_max:.2f}")
         print(f"  limiting subsystem {m.limiting_subsystem:>10}")
         print(f"  LCOM               {m.lcom_eur_per_kg:10.2f} EUR/kg  ({m.lcom_eur_per_mwh:.0f} EUR/MWh)")
-        print(f"  bus interventions  {m.bus_interventions:10d}   undervoltage trips {int(result.log['bus_tripped'].sum()):d}")
+        print(f"  bus interventions  {m.bus_interventions:10d}   undervoltage trips {m.bus_trips:d}")
         print(f"  wall time          {m.wall_time_s:10.1f} s")
 
         if not args.no_plots:
@@ -257,7 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--compare", action="store_true", help="run every controller and compare")
     run.add_argument("--offline", action="store_true", help="never touch the network")
     run.add_argument("--no-plots", action="store_true")
-    run.add_argument("--progress", action="store_true")
+    run.add_argument("--progress", action="store_true", help="print a percentage while each run proceeds")
     run.add_argument("--out", type=str, default="out")
     run.set_defaults(func=cmd_run)
 

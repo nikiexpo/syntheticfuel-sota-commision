@@ -79,17 +79,29 @@ def power(x, p):
 
 
 # --- non-smooth limiters (exact) ------------------------------------------
+# These three are the hottest functions in the whole project: a one-day
+# simulation calls them several million times. They therefore test the operand
+# types directly rather than going through `any_sym`, which builds a generator
+# and calls `any()` on every invocation -- that indirection alone accounted for
+# roughly a quarter of total runtime before it was removed. Behaviour is
+# identical; only the dispatch is cheaper.
 def fmax(a, b):
-    return ca.fmax(a, b) if any_sym(a, b) else np.maximum(a, b)
+    if isinstance(a, _SYM_TYPES) or isinstance(b, _SYM_TYPES):
+        return ca.fmax(a, b)
+    return np.maximum(a, b)
 
 
 def fmin(a, b):
-    return ca.fmin(a, b) if any_sym(a, b) else np.minimum(a, b)
+    if isinstance(a, _SYM_TYPES) or isinstance(b, _SYM_TYPES):
+        return ca.fmin(a, b)
+    return np.minimum(a, b)
 
 
 def clip(x, lo, hi):
     """Clamp `x` into [lo, hi]."""
-    return fmin(fmax(x, lo), hi)
+    if isinstance(x, _SYM_TYPES) or isinstance(lo, _SYM_TYPES) or isinstance(hi, _SYM_TYPES):
+        return ca.fmin(ca.fmax(x, lo), hi)
+    return np.minimum(np.maximum(x, lo), hi)
 
 
 def if_else(condition, if_true, if_false):

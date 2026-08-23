@@ -58,16 +58,32 @@ plt.rcParams.update(
 )
 
 
+SUBSYSTEM_COLOURS = {
+    "contactor": "#4FA3B8",
+    "calciner": "#C1453B",
+    "electrolyser": "#5B8FF9",
+    "sabatier": "#2A9D8F",
+    "gas": "#9AA0A6",
+}
+
+
 def timeline(
     result: SimulationResult,
     metrics: RunMetrics | None = None,
     path: Path | None = None,
 ) -> Path:
-    """Five-panel operating timeline for one run."""
+    """Six-panel operating timeline for one run.
+
+    Two panels exist specifically to show the thing the architecture is about:
+    the buffer levels, and the kiln/reactor temperatures. Reading them together
+    is how you see the chemical battery charging by day and discharging at night
+    -- solids loading rising while the sun is up, the H2 tank filling, then the
+    reactor drawing both down through the dark hours with the kiln coasting.
+    """
     log = result.log
     t = log.index
 
-    fig, axes = plt.subplots(5, 1, figsize=(11, 11), sharex=True)
+    fig, axes = plt.subplots(6, 1, figsize=(11, 13.5), sharex=True)
 
     # --- 1. solar resource ------------------------------------------------
     ax = axes[0]
@@ -81,16 +97,25 @@ def timeline(
     ax.set_title(f"{result.controller_name}  --  {result.site.name}  ({result.weather_provenance} weather)")
     ax.legend(ncol=3, loc="upper right")
 
-    # --- 2. power flows ---------------------------------------------------
+    # --- 2. load by subsystem (stacked) -----------------------------------
     ax = axes[1]
-    ax.fill_between(t, 0, log["process_power_W"] / 1e3, color=COLOURS["process"], alpha=0.55,
-                    label="process")
-    ax.plot(t, log["battery_charge_W"] / 1e3, color=COLOURS["battery"], lw=0.9, label="charge")
+    stack_keys = [k for k in ("sabatier", "contactor", "electrolyser", "calciner", "gas")
+                  if f"power.{k}" in log]
+    if stack_keys:
+        ax.stackplot(
+            t,
+            *[log[f"power.{k}"] / 1e3 for k in stack_keys],
+            labels=stack_keys,
+            colors=[SUBSYSTEM_COLOURS[k] for k in stack_keys],
+            alpha=0.85,
+        )
     ax.plot(t, -log["battery_discharge_W"] / 1e3, color=COLOURS["battery"], lw=0.9, ls="--",
-            label="discharge")
+            label="battery discharge")
+    ax.plot(t, log["battery_charge_W"] / 1e3, color=COLOURS["battery"], lw=0.9,
+            label="battery charge")
     ax.axhline(0.0, color=COLOURS["grid"], lw=0.8)
-    ax.set_ylabel("power  [kW]")
-    ax.legend(ncol=3, loc="upper right")
+    ax.set_ylabel("load  [kW]")
+    ax.legend(ncol=4, loc="upper right", fontsize=7)
 
     # --- 3. battery -------------------------------------------------------
     ax = axes[2]
@@ -98,26 +123,50 @@ def timeline(
     battery = result.plant["battery"]
     ax.axhline(battery.p.soc_min, color=COLOURS["warn"], lw=0.8, ls=":", label="limits")
     ax.axhline(battery.p.soc_max, color=COLOURS["warn"], lw=0.8, ls=":")
+    if "bus_tripped" in log and log["bus_tripped"].sum() > 0:
+        ax.fill_between(t, 0, 1, where=log["bus_tripped"] > 0, color=COLOURS["warn"],
+                        alpha=0.12, step="mid", label="undervoltage trip")
     ax.set_ylim(0.0, 1.0)
     ax.set_ylabel("battery SoC")
-    ax.legend(loc="upper right")
+    ax.legend(ncol=2, loc="upper right", fontsize=7.5)
 
-    # --- 4. process state -------------------------------------------------
+    # --- 4. the buffers ---------------------------------------------------
     ax = axes[3]
-    ax.fill_between(t, 0, log["process_load_fraction"], color=COLOURS["process"], alpha=0.45,
-                    label="load fraction")
-    ax.plot(t, log["process_warmth"], color=COLOURS["warn"], lw=1.0, label="thermal readiness")
-    if "bus_tripped" in log and log["bus_tripped"].sum() > 0:
-        tripped = log["bus_tripped"] > 0
-        ax.fill_between(t, 0, 1, where=tripped, color=COLOURS["warn"], alpha=0.12,
-                        step="mid", label="undervoltage trip")
+    if "solids_loading" in log:
+        ax.plot(t, log["solids_loading"], color=COLOURS["warn"], lw=1.3,
+                label="CaCO$_3$ loading")
+    if "gas_h2_fill" in log:
+        ax.plot(t, log["gas_h2_fill"], color=SUBSYSTEM_COLOURS["electrolyser"], lw=1.1,
+                label="H$_2$ tank")
+    if "gas_co2_fill" in log:
+        ax.plot(t, log["gas_co2_fill"], color=SUBSYSTEM_COLOURS["sabatier"], lw=1.1,
+                label="CO$_2$ tank")
     ax.set_ylim(0.0, 1.05)
-    ax.set_ylabel("process")
-    ax.legend(ncol=3, loc="upper right")
+    ax.set_ylabel("buffer fill")
+    ax.legend(ncol=3, loc="upper right", fontsize=7.5)
 
-    # --- 5. cumulative product -------------------------------------------
+    # --- 5. temperatures --------------------------------------------------
     ax = axes[4]
+    if "calciner_temperature_C" in log:
+        ax.plot(t, log["calciner_temperature_C"], color=SUBSYSTEM_COLOURS["calciner"], lw=1.2,
+                label="kiln")
+        threshold = result.plant["calciner"].threshold_temperature_K() - 273.15
+        ax.axhline(threshold, color=SUBSYSTEM_COLOURS["calciner"], lw=0.8, ls=":",
+                   label=f"calcination threshold ({threshold:.0f} $^\\circ$C)")
+    if "sabatier_temperature_C" in log:
+        ax.plot(t, log["sabatier_temperature_C"], color=SUBSYSTEM_COLOURS["sabatier"], lw=1.2,
+                label="reactor")
+    ax.set_ylabel("temperature  [$^\\circ$C]")
+    ax.legend(ncol=3, loc="upper right", fontsize=7.5)
+
+    # --- 6. cumulative product -------------------------------------------
+    ax = axes[5]
     ax.plot(t, log["ch4_total_kg"], color=COLOURS["process"], lw=1.4)
+    if "cos_zenith" in log:
+        ax.fill_between(t, 0, log["ch4_total_kg"].max() * 1.05,
+                        where=log["cos_zenith"] <= 0.0, color=COLOURS["text"], alpha=0.06,
+                        step="mid", label="night")
+        ax.legend(loc="upper left", fontsize=7.5)
     ax.set_ylabel("CH$_4$  [kg]")
     ax.set_xlabel("time (UTC)")
     ax.xaxis.set_major_locator(mdates.DayLocator())
@@ -126,8 +175,10 @@ def timeline(
     if metrics is not None:
         summary = (
             f"{metrics.ch4_kg:.0f} kg CH$_4$   "
+            f"night {metrics.night_production_fraction:.0%}   "
             f"utilisation {metrics.utilisation:.0%}   "
             f"curtailed {metrics.curtailment_fraction:.0%}   "
+            f"{metrics.sorbent_cycles:.2f} sorbent cycles   "
             f"LCOM {metrics.lcom_eur_per_kg:.2f} EUR/kg   "
             f"limiting: {metrics.limiting_subsystem}"
         )
@@ -149,8 +200,8 @@ def comparison(metrics: list[RunMetrics], path: Path | None = None) -> Path:
     panels = [
         ("CH$_4$ produced [kg]", [m.ch4_kg for m in metrics], COLOURS["process"], False),
         ("LCOM [EUR/kg]", [m.lcom_eur_per_kg for m in metrics], COLOURS["solar"], True),
-        ("curtailed [%]", [100 * m.curtailment_fraction for m in metrics], COLOURS["curtailed"], True),
-        ("battery cycles", [m.battery_efc for m in metrics], COLOURS["battery"], True),
+        ("night-time share [%]", [100 * m.night_production_fraction for m in metrics], COLOURS["battery"], False),
+        ("sorbent cycles", [m.sorbent_cycles for m in metrics], COLOURS["warn"], True),
     ]
 
     for ax, (title, values, colour, lower_better) in zip(axes, panels):
