@@ -66,6 +66,25 @@ class Economics:
             process=self.p.process_capex_per_kw * process.p.rated_power_kw,
         )
 
+    def capex_full(self, plant) -> CapexBreakdown:
+        """Installed cost of a fully assembled plant.
+
+        The process chain is costed on its aggregate electrical rating, which is
+        crude but consistent: a per-subsystem cost model would imply a precision
+        the underlying figures do not have. The electrolyser dominates in reality
+        and it dominates here, since it is most of the rated load.
+        """
+        rated_kw = 0.0
+        for key, sub in plant:
+            if key in ("pv", "battery") or sub.n_inputs < 2:
+                continue
+            rated_kw += float(sub.power_for_setpoint(sub.initial_state(), 1.0, 1.0, {})) / 1e3
+        return CapexBreakdown(
+            pv=self.p.pv_capex_per_kwp * plant["pv"].p.capacity_kwp,
+            battery=plant["battery"].capex_EUR(),
+            process=self.p.process_capex_per_kw * rated_kw,
+        )
+
     def capital_recovery_factor(self) -> float:
         """Annuity factor turning a lump-sum capex into an equivalent annual cost."""
         r = self.p.discount_rate

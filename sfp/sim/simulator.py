@@ -90,6 +90,7 @@ def _weather_row(dense: pd.DataFrame, i: int) -> dict[str, float]:
         "temp_air": float(row["temp_air"]),
         "relative_humidity": float(row["relative_humidity"]),
         "wind_speed": float(row["wind_speed"]),
+        "pressure": float(row["pressure"]),
         "cos_zenith": float(row["cos_zenith"]),
     }
 
@@ -122,8 +123,6 @@ def simulate(
     n_steps = min(config.n_steps, len(dense))
 
     pv = plant["pv"]
-    battery = plant["battery"]
-    process = plant["process"]
 
     forecast = weather.forecast(skill=config.forecast_skill, seed=config.seed)
     context = ControlContext(
@@ -138,7 +137,10 @@ def simulate(
     controller.reset(context)
 
     x = plant.initial_state()
-    request = bus_mod.Request()
+    request = bus_mod.Request.all_off()
+    last_inputs = bus_mod._inputs_from(plant, {}, {})
+    last_inputs["pv"] = np.array([0.0])
+    last_inputs["battery"] = np.array([0.0, 0.0])
     control_every = max(1, int(round(config.control_interval_s / config.dt_s)))
 
     records: list[dict[str, float]] = []
@@ -160,32 +162,33 @@ def simulate(
                 {
                     "pv_available_W": pv_available,
                     "battery_soc": float(states["battery"][0]),
-                    "process_warmth": float(states["process"][0]),
                     "time_s": t,
                 }
             )
+            # the controller also sees the plant's derived quantities (buffer
+            # levels, temperatures, sorbent loading) as they stand right now
+            measurement.update(plant.evaluate(t, x, last_inputs, w)[0])
             request = controller.act(t, states, measurement, forecast)
 
         # --- regulatory layer: make it feasible --------------------------
         dispatch = bus_mod.reconcile(
             request,
+            plant=plant,
+            state=x,
+            weather=w,
             pv_available_W=pv_available,
             pv_clipped_W=pv_clipped,
-            process=process,
-            process_state=states["process"],
-            battery=battery,
-            battery_state=states["battery"],
             dt_s=config.dt_s,
+            t=t,
         )
 
         curtail_fraction = (
             dispatch.pv_curtailed_W / pv_available if pv_available > 1e-9 else 0.0
         )
-        u = {
-            "pv": np.array([curtail_fraction]),
-            "battery": np.array([dispatch.battery_charge_W, dispatch.battery_discharge_W]),
-            "process": np.array([dispatch.process_load_fraction, dispatch.process_enable]),
-        }
+        u = bus_mod._inputs_from(plant, dispatch.setpoints, dispatch.enables)
+        u["pv"] = np.array([curtail_fraction])
+        u["battery"] = np.array([dispatch.battery_charge_W, dispatch.battery_discharge_W])
+        last_inputs = u
 
         # --- log ----------------------------------------------------------
         record = {"time_s": t}

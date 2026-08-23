@@ -1,0 +1,118 @@
+name: contactor
+description: >
+  Direct-air-capture contactor: ambient air is blown through a bed of CaO and
+  CO2 is fixed as CaCO3. Electrically it is the cheapest step in the plant --
+  fans only, no heat -- which is precisely why the control strategy wants to run
+  it whenever air is available and bank the result.
+
+  The interesting physics is that capture and fan power scale differently with
+  airflow. Capture rises roughly linearly with flow but the single-pass capture
+  fraction falls (less residence time), while fan power rises with the cube of
+  flow. The result is a pronounced economic optimum well below maximum flow, and
+  a controller that ignores it wastes most of its fan energy for a few percent
+  more CO2.
+
+params:
+  air_flow_max_m3_s:
+    value: 40.0
+    units: m^3/s
+    provenance: assumed
+    note: >
+      Maximum contactor airflow. Sized so that full flow can supply the Sabatier
+      reactor's stoichiometric CO2 demand at the reference plant rating.
+
+  air_flow_design_m3_s:
+    value: 24.0
+    units: m^3/s
+    provenance: assumed
+    note: "Flow at which the single-pass capture fraction equals its design value."
+
+  capture_fraction_design:
+    value: 0.65
+    units: "-"
+    provenance: assumed
+    note: >
+      Single-pass CO2 capture at design flow. Sets the contactor NTU via
+      eta = 1 - exp(-NTU). Real air contactors run 0.5-0.75 single pass. Sized so
+      that design flow comfortably covers the Sabatier reactor's stoichiometric
+      demand: at 0.50 the contactor could only just meet it at maximum fan power,
+      which left the controller no room to exploit the part-flow optimum.
+    uncertain: true
+    sigma: 0.12
+    bounds: [0.10, 0.90]
+
+  fan_power_rated_kw:
+    value: 20.0
+    units: kW
+    provenance: assumed
+    note: >
+      Fan shaft power at maximum flow. With the capture model this gives roughly
+      500 kWh per tonne CO2 at full flow and 165 kWh/t at design flow -- the
+      latter is close to the ~366 kWh/t reported for large liquid-solvent air
+      contactors, and the spread between the two is the optimum the controller
+      is meant to find.
+    uncertain: true
+    sigma: 0.20
+
+  fan_exponent:
+    value: 3.0
+    units: "-"
+    provenance: literature
+    source: "Fan affinity laws: pressure ~ flow^2 on a fixed system curve, so shaft power ~ flow^3"
+
+  fan_idle_kw:
+    value: 0.4
+    units: kW
+    provenance: assumed
+    note: "Instrumentation and dampers while the contactor is energised but not blowing."
+
+  co2_mole_fraction:
+    value: 420.0e-6
+    units: mol/mol
+    provenance: measured
+    source: "NOAA Global Monitoring Laboratory, global mean atmospheric CO2, 2024"
+
+  activation_energy_J_mol:
+    value: 20000.0
+    units: J/mol
+    provenance: assumed
+    note: >
+      Apparent activation energy of ambient carbonation, giving roughly a 1.3x
+      rate increase from 10 to 30 degC. Deliberately mild: at 420 ppm the process
+      is limited by air throughput and sorbent surface, not by kinetics.
+    uncertain: true
+    sigma: 0.25
+
+  temperature_reference_K:
+    value: 298.15
+    units: K
+    provenance: assumed
+    note: "Reference temperature for the rate correction."
+
+  humidity_half_saturation:
+    value: 0.30
+    units: "-"
+    provenance: assumed
+    note: >
+      Relative humidity at which the moisture promotion factor reaches half its
+      maximum. Surface water films catalyse carbonation, so a dry desert site
+      captures measurably less than a coastal one at the same temperature. This
+      is one of the few places where siting choice changes process performance
+      rather than just solar yield.
+    uncertain: true
+    sigma: 0.30
+
+  humidity_reference:
+    value: 0.60
+    units: "-"
+    provenance: assumed
+    note: "Relative humidity at which the promotion factor is normalised to 1."
+
+  loading_taper:
+    value: 0.90
+    units: "-"
+    provenance: assumed
+    note: >
+      Fractional sorbent loading at which the capture rate begins to taper
+      sharply. Below this the bed behaves as if fresh; above it the remaining
+      CaO is increasingly hard to reach.

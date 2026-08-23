@@ -1,0 +1,121 @@
+name: buffers
+description: >
+  Gas storage between the subsystems, plus the water balance.
+
+  These are the buffers that decouple the plant in time, and their sizes tell the
+  story the project is about. The hydrogen tank holds ~6 h of production and the
+  CO2 tank ~6 h, each needing a pressure vessel. The solid CaCO3 inventory holds
+  roughly 12 h of CO2 demand in an unpressurised pile of rock. Storing a mole of
+  CO2 as CaCO3 costs almost nothing; storing it as compressed gas costs a vessel.
+  That asymmetry is why the control strategy banks carbon in the solid phase and
+  keeps the gas buffers small.
+
+params:
+  # --- hydrogen ---------------------------------------------------------
+  h2_capacity_mol:
+    value: 30000.0
+    units: mol
+    provenance: assumed
+    note: >
+      About 60 kg of H2, or 8.3 h of the reactor at full feed. At 30 bar and
+      300 K that is a ~25 m^3 vessel.
+
+      Sized deliberately at 113 % of a summer day's electrolyser output
+      (26,400 mol). An earlier 20,000 mol tank held only 76 % of a day, so it
+      filled every afternoon and forced the electrolyser to stop while the sun
+      was still up -- the buffer was too small to do the one job it exists for.
+      This is the single sizing decision that most affects whether the plant can
+      run through the night.
+
+  h2_initial_fraction:
+    value: 0.30
+    units: "-"
+    provenance: assumed
+
+  h2_storage_pressure_bar:
+    value: 30.0
+    units: bar
+    provenance: literature
+    source: "PEM electrolysers commonly deliver 30 bar directly, avoiding a first compression stage"
+    note: "Delivered at stack pressure, so no hydrogen compressor is modelled."
+
+  h2_min_fraction:
+    value: 0.05
+    units: "-"
+    provenance: assumed
+    note: "Cushion gas: the reactor cannot draw the tank completely empty."
+
+  # --- carbon dioxide ---------------------------------------------------
+  co2_capacity_mol:
+    value: 6000.0
+    units: mol
+    provenance: assumed
+    note: >
+      About 264 kg of CO2, ~8 h of Sabatier demand. Deliberately small: the
+      cheap place to store carbon is as CaCO3, and an oversized gas buffer would
+      hide that.
+
+  co2_initial_fraction:
+    value: 0.20
+    units: "-"
+    provenance: assumed
+
+  co2_min_fraction:
+    value: 0.02
+    units: "-"
+    provenance: assumed
+
+  co2_compressor_kJ_per_mol:
+    value: 17.5
+    units: kJ/mol
+    provenance: assumed
+    note: >
+      Work to raise CO2 from the calciner's 0.3 atm to the reactor's ~5 bar.
+      Isothermal ideal work is n R T ln(p2/p1) = 7.0 kJ/mol at 300 K; a
+      multistage intercooled machine at ~60 % isothermal efficiency gives about
+      17.5 kJ/mol, or 3.5 kW at the reference CO2 rate. Small but not zero, and
+      it scales with calcination rate rather than with time.
+    uncertain: true
+    sigma: 0.25
+
+  # --- water ------------------------------------------------------------
+  water_capacity_kg:
+    value: 5000.0
+    units: kg
+    provenance: assumed
+    note: >
+      5 m^3 demineralised water tank, roughly a week of net make-up at full
+      production. At a remote arid site this is delivered by road, which is why
+      it carries a real cost in the objective.
+
+  water_initial_fraction:
+    value: 0.70
+    units: "-"
+    provenance: assumed
+
+  water_min_fraction:
+    value: 0.05
+    units: "-"
+    provenance: assumed
+    note: "Pump NPSH limit; the electrolyser trips below this."
+
+  condensate_recovery:
+    value: 0.95
+    units: "-"
+    provenance: assumed
+    note: >
+      Fraction of the Sabatier reactor's product water recovered by the condenser
+      and returned to the feed tank. The Sabatier reaction makes 2 mol H2O per
+      mol CH4 while electrolysis consumed 4, so recovery roughly halves the net
+      make-up: about 2.36 kg of water per kg of methane instead of 4.5.
+    uncertain: true
+    sigma: 0.05
+    bounds: [0.0, 1.0]
+
+  water_makeup_rate_kg_s:
+    value: 0.0
+    units: kg/s
+    provenance: assumed
+    note: >
+      Continuous make-up, zero in the base case: the tank is filled by delivery,
+      not by a pipeline. Consumption is tracked so the report can cost it.

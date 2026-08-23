@@ -20,9 +20,14 @@ from pathlib import Path
 import pandas as pd
 
 from sfp.economics import Economics
-from sfp.models.aggregate import AggregateProcess
 from sfp.models.battery import Battery
+from sfp.models.buffers import GasBuffer, WaterTank
+from sfp.models.calciner import Calciner
+from sfp.models.contactor import AirContactor
+from sfp.models.electrolyser import Electrolyser
 from sfp.models.pv import PVArray
+from sfp.models.sabatier import SabatierReactor
+from sfp.models.solids import SolidsInventory
 from sfp.params import load_params
 from sfp.report import assumptions as assumptions_mod
 from sfp.report import plots
@@ -44,17 +49,41 @@ REFERENCE_SITES = {
 }
 
 
-def build_plant(pv_kwp: float, battery_kwh: float, battery_kw: float, process_kw: float) -> Plant:
-    """Assemble the reference plant at a given sizing."""
+def build_plant(
+    pv_kwp: float,
+    battery_kwh: float,
+    battery_kw: float,
+    calciner_kw: float = 150.0,
+    electrolyser_scale: float = 1.0,
+) -> Plant:
+    """Assemble the reference plant at a given sizing.
+
+    **Registration order is load-bearing.** It is the phase-1 evaluation order,
+    and it follows the material flow: the sorbent inventory publishes its loading
+    before the contactor tapers against it, the calciner publishes its CO2 rate
+    before the gas buffer accumulates it, and the buffers publish their levels
+    before the reactor throttles against them. `Plant` validates this at
+    construction, so a wrong order raises rather than silently producing zeros.
+    """
     return Plant(
         {
             "pv": PVArray(load_params("pv").override(capacity_kwp=pv_kwp)),
             "battery": Battery(
                 load_params("battery").override(capacity_kwh=battery_kwh, power_kw=battery_kw)
             ),
-            "process": AggregateProcess(
-                load_params("aggregate").override(rated_power_kw=process_kw)
+            "solids": SolidsInventory(load_params("solids")),
+            "contactor": AirContactor(load_params("contactor")),
+            "calciner": Calciner(
+                load_params("calciner").override(heater_power_rated_kw=calciner_kw)
             ),
+            "electrolyser": Electrolyser(
+                load_params("electrolyser").override(
+                    n_cells=105.0 * electrolyser_scale
+                )
+            ),
+            "gas": GasBuffer(load_params("buffers")),
+            "water": WaterTank(load_params("buffers")),
+            "sabatier": SabatierReactor(load_params("sabatier")),
         }
     )
 
@@ -128,12 +157,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"\nSite      {site.name}   ({site.latitude:.3f}, {site.longitude:.3f}, {site.altitude:.0f} m)")
     print(f"Array     {args.pv:.0f} kWp at {site.tilt_deg:.1f} deg tilt")
     print(f"Battery   {args.battery:.0f} kWh / {args.battery_power:.0f} kW")
-    print(f"Process   {args.process:.0f} kW")
+    print(f"Calciner  {args.calciner:.0f} kW")
     print(f"Window    {args.days:.0f} days from day-of-year {args.start_day}")
     print(f"Weather   {weather.provenance}: {weather.source}\n")
 
     for controller in controllers_for(names):
-        plant = build_plant(args.pv, args.battery, args.battery_power, args.process)
+        plant = build_plant(args.pv, args.battery, args.battery_power, args.calciner)
         result = simulate(plant, controller, weather, config, economics=economics)
         m = compute_metrics(result, economics)
         results.append(result)
@@ -217,7 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--pv", type=float, default=500.0, help="array capacity, kWp")
     run.add_argument("--battery", type=float, default=1000.0, help="battery energy, kWh")
     run.add_argument("--battery-power", type=float, default=400.0, help="battery power, kW")
-    run.add_argument("--process", type=float, default=350.0, help="process electrical rating, kW")
+    run.add_argument("--calciner", type=float, default=150.0, help="calciner heater rating, kW")
     run.add_argument("--days", type=float, default=10.0, help="simulation length, days")
     run.add_argument("--start-day", type=int, default=172, help="day of year to start (172 = 21 June)")
     run.add_argument("--dt", type=float, default=60.0, help="plant integration step, s")

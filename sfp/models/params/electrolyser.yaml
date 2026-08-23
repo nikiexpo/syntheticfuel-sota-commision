@@ -1,0 +1,194 @@
+name: electrolyser
+description: >
+  Proton-exchange-membrane water electrolyser. Structure follows Gorgun (2006),
+  with a lumped stack thermal state added -- the paper models mole balances and
+  voltage but not stack temperature, and temperature matters here because it
+  moves the ohmic loss and therefore the efficiency the scheduler sees.
+
+  PEM rather than alkaline is the right choice for an intermittent plant: it
+  tolerates rapid ramps and cold starts in minutes rather than hours. The cost is
+  a minimum load set by hydrogen crossover through the membrane, which is a
+  safety limit and not negotiable.
+
+  The scheduling-relevant behaviour is that **total efficiency peaks well below
+  rated load**. Stack efficiency falls monotonically with current (overpotentials
+  grow), but auxiliary load is roughly fixed, so at low load the auxiliaries
+  dominate. The two effects cross at around 40-50 % of rating. A controller that
+  runs the stack flat out whenever the sun is strong is leaving hydrogen on the
+  table.
+
+params:
+  n_cells:
+    value: 105.0
+    units: "-"
+    provenance: assumed
+    note: "Cells in series. Chosen with the active area to give ~300 kW at 1.5 A/cm^2."
+
+  active_area_cm2:
+    value: 1000.0
+    units: cm^2
+    provenance: assumed
+    note: "Per-cell membrane area, typical of a commercial stack module."
+
+  current_density_max_A_cm2:
+    value: 1.5
+    units: A/cm^2
+    provenance: literature
+    source: "Typical PEM electrolyser rated current density, 1.0-2.0 A/cm^2"
+
+  current_density_min_fraction:
+    value: 0.10
+    units: "-"
+    provenance: literature
+    source: "PEM minimum turndown set by H2 crossover into the anode O2 stream (safety limit)"
+    note: >
+      Below this the hydrogen concentration in oxygen approaches the lower
+      flammability limit. A hard constraint, never relaxed by the optimiser.
+
+  reversible_voltage_V:
+    value: 1.229
+    units: V
+    provenance: literature
+    source: "Standard reversible potential for water electrolysis at 298 K, 1 bar"
+
+  reversible_temp_coefficient_V_K:
+    value: -0.9e-3
+    units: V/K
+    provenance: literature
+    source: "dE/dT for water electrolysis, approx -0.9 mV/K"
+
+  thermoneutral_voltage_V:
+    value: 1.481
+    units: V
+    provenance: literature
+    source: "Thermoneutral voltage (HHV basis) for water electrolysis at 298 K"
+    note: >
+      Cell voltage above this generates heat, below it absorbs heat. Used
+      directly in the stack energy balance rather than differencing large
+      numbers.
+
+  exchange_current_density_A_cm2:
+    value: 1.0e-4
+    units: A/cm^2
+    provenance: assumed
+    note: >
+      Effective anode exchange current density for an iridium-oxide catalyst.
+      Fitted so the polarisation curve gives ~1.97 V at 1.5 A/cm^2 and 60 degC,
+      which matches commercial PEM stack data.
+    uncertain: true
+    sigma: 0.40
+
+  charge_transfer_coefficient:
+    value: 0.5
+    units: "-"
+    provenance: literature
+    source: "Symmetric charge-transfer coefficient, standard Butler-Volmer assumption"
+
+  area_resistance_ohm_cm2:
+    value: 0.15
+    units: ohm cm^2
+    provenance: literature
+    source: "Nafion-based PEM area-specific resistance at 60 degC, 0.10-0.20 ohm cm^2"
+    uncertain: true
+    sigma: 0.15
+
+  resistance_temp_coefficient:
+    value: -0.005
+    units: 1/K
+    provenance: assumed
+    note: >
+      Membrane conductivity rises with temperature, so resistance falls ~0.5 %/K.
+      This is why a warm stack is a more efficient stack, and why the controller
+      should think twice before letting it cool.
+
+  faraday_efficiency:
+    value: 0.98
+    units: "-"
+    provenance: literature
+    source: "PEM Faradaic efficiency, typically >0.97 above minimum load"
+
+  auxiliary_power_kw:
+    value: 15.0
+    units: kW
+    provenance: assumed
+    note: >
+      Water circulation, gas drying, control and the balance of plant while the
+      stack is energised. About 5 % of rating -- this term is what creates the
+      part-load efficiency peak.
+    uncertain: true
+    sigma: 0.20
+
+  thermal_capacity_J_K:
+    value: 250000.0
+    units: J/K
+    provenance: assumed
+    note: >
+      Stack plus coolant inventory. Gives a cold start of only ~2.8 kWh and a few
+      minutes, which is the whole reason PEM suits an intermittent plant.
+    uncertain: true
+    sigma: 0.20
+
+  temperature_setpoint_K:
+    value: 333.15
+    units: K
+    provenance: assumed
+    note: "60 degC nominal operating temperature."
+
+  temperature_max_K:
+    value: 353.15
+    units: K
+    provenance: literature
+    source: "Nafion membrane upper limit, ~80 degC before accelerated degradation"
+
+  temperature_initial_K:
+    value: 293.15
+    units: K
+    provenance: assumed
+
+  cooling_gain_W_K:
+    value: 6000.0
+    units: W/K
+    provenance: assumed
+    note: >
+      Proportional gain of the stack thermal-management loop. This is a local
+      regulatory controller, not a decision the supervisor makes -- the stack
+      looks after its own temperature.
+
+  cooling_power_max_W:
+    value: 150000.0
+    units: W
+    provenance: assumed
+    note: "Maximum heat rejection of the cooling circuit."
+
+  cooling_parasitic_fraction:
+    value: 0.02
+    units: "-"
+    provenance: assumed
+    note: "Pump and fan power as a fraction of heat rejected."
+
+  ambient_UA_W_K:
+    value: 150.0
+    units: W/K
+    provenance: assumed
+    note: "Passive loss from the stack enclosure to ambient."
+
+  degradation_V_per_s:
+    value: 8.33e-10
+    units: V/s
+    provenance: literature
+    source: "PEM stack degradation ~3 microvolt/h at rated load (2-10 uV/h reported)"
+    note: "Cell voltage rise. Over a 10-year life this is ~0.26 V, about 13 % efficiency loss."
+
+  degradation_per_start:
+    value: 2.0e-6
+    units: V
+    provenance: assumed
+    note: >
+      Additional voltage rise per start/stop cycle. Cycling is measurably worse
+      than steady operation for PEM, which is what makes the controller reluctant
+      to chase clouds even though the stack *can* ramp fast.
+
+  voltage_degradation_initial_V:
+    value: 0.0
+    units: V
+    provenance: assumed

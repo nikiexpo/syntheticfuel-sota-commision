@@ -23,7 +23,10 @@ from sfp.params import (
 
 def test_every_parameter_file_loads():
     sets = load_all()
-    assert set(sets) >= {"pv", "battery", "aggregate", "economics"}
+    assert set(sets) >= {
+        "pv", "battery", "economics", "solids", "contactor",
+        "calciner", "buffers", "electrolyser", "sabatier",
+    }
     for name, ps in sets.items():
         assert len(ps.params) > 0, name
 

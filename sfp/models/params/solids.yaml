@@ -1,0 +1,69 @@
+name: solids
+description: >
+  The circulating calcium sorbent inventory: the plant's largest and cheapest
+  buffer. CaO carbonates in the air contactor (cheap, ambient, fans only) and
+  CaCO3 calcines in the kiln (900 degC, enormous). The inventory between them is
+  captured CO2 held in solid form, and holding it costs nothing at all -- which
+  is why it, not the battery, is the buffer that matters for riding through the
+  night and through multi-day weather.
+
+  Sorbent capacity decays with cycle number, so every calcination carries a
+  long-run cost. That single fact is what separates a planning controller from a
+  greedy one.
+
+params:
+  n_total_mol:
+    value: 50000.0
+    units: mol
+    provenance: assumed
+    note: >
+      Total calcium inventory (CaO + CaCO3), conserved. 50 kmol is about 2.8 t as
+      CaO or 5.0 t as CaCO3. Sized to buffer roughly 12 h of full-rate CO2 demand
+      at an aged sorbent conversion of ~0.2.
+
+  n_caco3_initial_fraction:
+    value: 0.15
+    units: "-"
+    provenance: assumed
+    note: "Cold-start carbonation state of the inventory."
+
+  cycle_number_initial:
+    value: 5.0
+    units: cycles
+    provenance: assumed
+    note: >
+      Mean cycle number at the start of a run. Nonzero because a fresh sorbent
+      would flatter the controller: the interesting regime is a partly-aged bed
+      where the marginal cost of a calcination is already visible.
+
+  grasa_residual_conversion:
+    value: 0.075
+    units: "-"
+    provenance: literature
+    source: "Grasa & Abanades (2006), Ind. Eng. Chem. Res. 45, 8846 -- residual conversion X_r after many cycles"
+    note: "CaO conversion asymptotes here rather than falling to zero."
+    uncertain: true
+    sigma: 0.15
+
+  grasa_deactivation_constant:
+    value: 0.52
+    units: "-"
+    provenance: literature
+    source: "Grasa & Abanades (2006) -- deactivation constant k in X_N = 1/(kN + 1/(1-X_r)) + X_r"
+    uncertain: true
+    sigma: 0.15
+
+  makeup_rate_mol_s:
+    value: 0.0
+    units: mol/s
+    provenance: assumed
+    note: >
+      Fresh-sorbent make-up, zero in the base case. A real plant purges spent
+      sorbent and adds fresh limestone, which caps the mean cycle number. Left at
+      zero so that deactivation is visible over a short run rather than masked.
+
+  purge_fraction:
+    value: 0.0
+    units: "-"
+    provenance: assumed
+    note: "Fraction of calcined solids purged. Zero in the base case; see make-up."

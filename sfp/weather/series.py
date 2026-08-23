@@ -122,6 +122,19 @@ class WeatherSeries:
                     ).to_numpy(dtype=float)
                 ),
                 "wind_speed": interp(self.frame["wind_speed"].to_numpy(dtype=float)),
+                # ambient pressure sets the molar density of air, and therefore how
+                # much CO2 a cubic metre through the contactor actually contains --
+                # a plant on a 650 m plateau breathes ~7 % thinner air than one at
+                # sea level, at the same fan power
+                "pressure": interp(
+                    self.frame.get(
+                        "pressure",
+                        pd.Series(
+                            101325.0 * np.exp(-self.site.altitude / 8400.0),
+                            index=self.frame.index,
+                        ),
+                    ).to_numpy(dtype=float)
+                ),
                 "cos_zenith": pos.cos_zenith,
             },
             index=index,

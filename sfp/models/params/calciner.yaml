@@ -1,0 +1,159 @@
+name: calciner
+description: >
+  Electrically heated rotary kiln: CaCO3 -> CaO + CO2 at about 900 degC. The
+  single largest and most flexible electrical load in the plant, and the reason
+  the scheduling problem is interesting.
+
+  Two properties dominate. First, the reaction has a sharp thermodynamic
+  threshold -- below the temperature at which the equilibrium CO2 pressure
+  exceeds the kiln's operating pressure, nothing happens at all. Second, the
+  refractory has enormous thermal mass, so reaching that threshold from cold
+  costs hundreds of kWh and takes hours. Together they turn "should the kiln run
+  today?" into a genuine unit-commitment decision rather than a set-point choice.
+
+params:
+  heater_power_rated_kw:
+    value: 150.0
+    units: kW
+    provenance: supplied
+    note: >
+      Deliberately oversized relative to the steady-state CO2 demand (~70 kW).
+      The excess capacity is what lets the kiln absorb midday solar surplus and
+      bank CO2 -- it is the charging power of the chemical battery, and sizing it
+      is one of the design questions the siting tool should answer.
+
+  heater_efficiency:
+    value: 0.95
+    units: "-"
+    provenance: assumed
+    note: "Electrical resistance heating into the kiln shell."
+    uncertain: true
+    sigma: 0.03
+    bounds: [0.80, 0.99]
+
+  thermal_capacity_J_K:
+    value: 3.0e6
+    units: J/K
+    provenance: assumed
+    note: >
+      Lumped refractory plus solids holdup, about 3 t of refractory at
+      1.0 kJ/(kg K). Heating from ambient to 900 degC takes ~2.6 GJ = 728 kWh,
+      which at rated power is a 4.9 hour cold start.
+    uncertain: true
+    sigma: 0.15
+
+  heat_loss_UA_W_K:
+    value: 17.0
+    units: W/K
+    provenance: assumed
+    note: >
+      Shell loss coefficient, giving ~15 kW standing loss at 900 degC against a
+      20 degC ambient. The time constant C/UA is about 49 h, so the kiln stays
+      warm overnight -- holding it costs ~180 kWh over 12 h, against ~162 kWh to
+      reheat it after letting it drift. Those being nearly equal is what makes
+      the overnight hold/cool decision genuinely non-obvious.
+    uncertain: true
+    sigma: 0.20
+
+  wind_loss_coefficient:
+    value: 0.6
+    units: "W/(K (m/s))"
+    provenance: assumed
+    note: "Additional convective shell loss per unit wind speed."
+
+  calcination_rate_max_mol_s:
+    value: 0.45
+    units: mol/s
+    provenance: assumed
+    note: >
+      Maximum solids throughput, about 2.2x the Sabatier reactor's steady CO2
+      demand. Set by the screw feeder and kiln residence time, not by chemistry.
+
+  operating_pressure_atm:
+    value: 0.30
+    units: atm
+    provenance: assumed
+    note: >
+      CO2 partial pressure in the calciner. Sub-atmospheric operation (steam
+      sweep or vacuum) lowers the calcination threshold from ~900 degC to
+      ~819 degC, which is a real and commonly used design lever. It sets the
+      temperature at which the kiln becomes productive at all.
+
+  baker_prefactor_atm:
+    value: 4.137e7
+    units: atm
+    provenance: literature
+    source: "Baker (1962), J. Chem. Soc. -- CaCO3 decomposition equilibrium, p_eq = 4.137e7 exp(-20474/T) atm"
+    note: "Gives p_eq = 1 atm at 1170 K (897 degC), the textbook calcination temperature."
+
+  baker_exponent_K:
+    value: 20474.0
+    units: K
+    provenance: literature
+    source: "Baker (1962) -- exponent of the CaCO3/CaO equilibrium correlation"
+
+  kinetic_prefactor_1_s:
+    value: 2.207e5
+    units: 1/s
+    provenance: assumed
+    note: >
+      Lumped rate constant folding in particle size, surface area and heat
+      transfer to the solids. Normalised so the Arrhenius factor reaches unity at
+      the 1173 K target: combined with the thermodynamic driving force the kiln
+      becomes productive at ~1092 K and saturates near 1200 K. Calibrated, not
+      measured -- the absolute rate is a design assumption, while its temperature
+      *shape* comes from Baker's equilibrium and a literature activation energy.
+    uncertain: true
+    sigma: 0.30
+
+  kinetic_activation_J_mol:
+    value: 120000.0
+    units: J/mol
+    provenance: literature
+    source: "Typical apparent activation energy for CaCO3 decomposition, 100-170 kJ/mol"
+    uncertain: true
+    sigma: 0.20
+
+  solids_feed_temperature_K:
+    value: 373.15
+    units: K
+    provenance: assumed
+    note: "Solids enter preheated by the recuperator on the CaO return leg."
+
+  solids_heat_capacity_J_kg_K:
+    value: 1000.0
+    units: J/(kg K)
+    provenance: literature
+    source: "CaCO3 specific heat capacity, ~0.9-1.1 kJ/(kg K) over 100-900 degC"
+
+  temperature_max_K:
+    value: 1273.15
+    units: K
+    provenance: assumed
+    note: "Refractory limit, 1000 degC. A hard constraint the NMPC may not cross."
+
+  temperature_target_K:
+    value: 1173.15
+    units: K
+    provenance: assumed
+    note: "Nominal operating temperature, 900 degC."
+
+  temperature_initial_K:
+    value: 293.15
+    units: K
+    provenance: assumed
+    note: "Cold start at ambient."
+
+  feedstock_reference_mol:
+    value: 500.0
+    units: mol
+    provenance: assumed
+    note: >
+      CaCO3 inventory below which the calciner rate tapers, representing the kiln
+      running out of feed. Small relative to the 50 kmol total inventory.
+
+  standby_power_kw:
+    value: 3.0
+    units: kW
+    provenance: assumed
+    note: "Drives, seals and instrumentation while the kiln is energised."

@@ -117,6 +117,30 @@ class Subsystem(ABC):
     def n_inputs(self) -> int:
         return len(self.inputs)
 
+    # --- coupling between subsystems --------------------------------------
+    @property
+    def requires(self) -> tuple[str, ...]:
+        """Coupling keys this subsystem's `outputs` reads out of `w`.
+
+        Declared so `Plant` can verify at construction that they are produced by
+        an earlier subsystem or by the weather. Without that check a typo or a
+        reordering silently yields `w.get(key, 0.0)` -- a zero rate that looks
+        like a plant which simply chose not to run, which is close to the worst
+        possible failure mode for this project.
+        """
+        return ()
+
+    @property
+    def requires_for_rhs(self) -> tuple[str, ...]:
+        """Coupling keys `rhs` reads. No ordering constraint: every subsystem's
+        outputs are available by the time any `rhs` is evaluated."""
+        return ()
+
+    @property
+    def provides(self) -> tuple[str, ...]:
+        """Coupling keys this subsystem publishes for others to consume."""
+        return ()
+
     # --- dynamics ---------------------------------------------------------
     @abstractmethod
     def rhs(self, t, x, u, w: Mapping[str, Any]):
@@ -152,6 +176,70 @@ class Subsystem(ABC):
         """The 'do nothing' input -- clipped into the admissible box."""
         lower, upper = self.input_bounds()
         return np.clip(np.zeros(self.n_inputs), lower, upper)
+
+    # --- uniform dispatch protocol ----------------------------------------
+    # Every controllable subsystem takes (setpoint, enable) as its inputs, so the
+    # DC bus can size and shed any of them without knowing what it is.
+
+    def power_for_setpoint(
+        self, x, setpoint: float, enable: float = 1.0, w: Mapping[str, Any] | None = None
+    ) -> float:
+        """Electrical draw at a commanded setpoint, W."""
+        if self.n_inputs < 2:
+            return 0.0
+        u = np.array([setpoint, enable], dtype=float)
+        return float(self.outputs(0.0, x, u, w or {})["power_electrical_W"])
+
+    def parasitic_power_W(
+        self, x, enable: float = 1.0, w: Mapping[str, Any] | None = None
+    ) -> float:
+        """Draw with the setpoint at zero but the subsystem energised.
+
+        The floor a dispatch must clear before this subsystem can do any useful
+        work. For the Sabatier reactor this is almost its entire draw, which is
+        why turning its feed down saves nothing and only shutting it off does.
+        """
+        return self.power_for_setpoint(x, 0.0, enable, w)
+
+    def setpoint_for_power(
+        self,
+        x,
+        power_W: float,
+        enable: float = 1.0,
+        w: Mapping[str, Any] | None = None,
+        min_setpoint: float = 0.0,
+    ) -> float:
+        """Largest setpoint whose draw fits inside `power_W`.
+
+        Bisection rather than an analytic inverse: draw is monotonically
+        non-decreasing in setpoint for every subsystem here, but the shape varies
+        (cubic for a fan, linear for a heater, polarisation-curve for a stack,
+        and flat for the Sabatier reactor). Bisection handles all of them, and
+        returns 0 when even the parasitic floor cannot be met.
+        """
+        if enable < 0.5 or self.n_inputs < 2:
+            return 0.0
+        if self.power_for_setpoint(x, min_setpoint, enable, w) > power_W + 1e-9:
+            return 0.0
+        if self.power_for_setpoint(x, 1.0, enable, w) <= power_W:
+            return 1.0
+        low, high = min_setpoint, 1.0
+        for _ in range(40):
+            mid = 0.5 * (low + high)
+            if self.power_for_setpoint(x, mid, enable, w) <= power_W:
+                low = mid
+            else:
+                high = mid
+        return float(low)
+
+    @property
+    def min_setpoint(self) -> float:
+        """Lowest setpoint at which the subsystem may operate at all.
+
+        Nonzero where a real turndown limit exists -- gas crossover in the
+        electrolyser, for instance. The bus snaps anything below this to zero.
+        """
+        return 0.0
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (

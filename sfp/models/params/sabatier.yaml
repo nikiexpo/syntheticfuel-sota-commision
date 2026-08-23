@@ -1,0 +1,203 @@
+name: sabatier
+description: >
+  Fixed-bed Sabatier methanation reactor over Ru/Al2O3:
+  CO2 + 4 H2 -> CH4 + 2 H2O, exothermic at -165 kJ/mol.
+
+  Lumped from the three-zone axial model of Moioli, Gallandat & Zuttel (2019),
+  which resolves the reactor as an activation zone, a heat-removal zone and a
+  final equilibrium-approach zone. For scheduling we need only the aggregate: a
+  hotspot temperature that must stay inside a window, and a conversion set by how
+  close that temperature lets the reactor approach equilibrium.
+
+  The scheduling-relevant property is that this reactor is **nearly free to run
+  once lit**. It consumes almost no electricity -- the reaction heats itself --
+  so it is the natural night-time load, drawing down the hydrogen and CO2 banked
+  during the day. Starting it, on the other hand, needs an electric preheat of
+  ~31 kWh, and every thermal cycle ages the catalyst. Light it once and keep it
+  lit is usually right; deciding when "usually" fails is the planner's job.
+
+params:
+  co2_feed_max_mol_s:
+    value: 0.25
+    units: mol/s
+    provenance: supplied
+    note: >
+      Maximum CO2 feed, about 1.2x the rate that consumes the electrolyser's
+      full hydrogen output. Sets the plant's peak methane rate at ~14.4 kg/h.
+
+  thermal_capacity_J_K:
+    value: 400000.0
+    units: J/K
+    provenance: assumed
+    note: >
+      Catalyst bed, vessel and internals, ~500 kg at 0.8 kJ/(kg K). Preheating
+      from ambient to 300 degC costs about 31 kWh.
+    uncertain: true
+    sigma: 0.20
+
+  equilibrium_T50_K:
+    value: 810.0
+    units: K
+    provenance: literature
+    source: >
+      Logistic fit to the CO2-methanation equilibrium conversion curve at ~5 bar
+      and stoichiometric feed (Moioli et al. 2019, Fig. 2)
+    note: >
+      X_eq = 1/(1 + exp((T - T50)/w)). Reproduces ~0.97 at 300 degC, ~0.63 at
+      500 degC and ~0.45 at 550 degC. A fit, not a thermodynamic calculation --
+      it is used because the NMPC needs a smooth closed form, and the error
+      against a full Gibbs minimisation is a few percent over the operating window.
+
+  equilibrium_width_K:
+    value: 70.0
+    units: K
+    provenance: literature
+    source: "Width of the same logistic fit"
+
+  kinetic_damkohler_ref:
+    value: 6.0
+    units: "-"
+    provenance: assumed
+    note: >
+      Damkohler number at reference temperature and full feed, giving a ~99.8 %
+      approach to equilibrium at design conditions. Folds catalyst loading,
+      dispersion and residence time into one number.
+    uncertain: true
+    sigma: 0.30
+
+  kinetic_activation_J_mol:
+    value: 80000.0
+    units: J/mol
+    provenance: literature
+    source: "Apparent activation energy for CO2 methanation over Ru/Al2O3, 70-95 kJ/mol"
+    uncertain: true
+    sigma: 0.20
+
+  kinetic_reference_T_K:
+    value: 573.15
+    units: K
+    provenance: assumed
+    note: "Reference temperature for the Damkohler normalisation, 300 degC."
+
+  temperature_ignition_K:
+    value: 523.15
+    units: K
+    provenance: assumed
+    note: >
+      250 degC. Below this the rate is negligible and the reaction will not
+      sustain itself -- the Arrhenius term handles the transition, this value is
+      recorded so the controller knows where the cliff is.
+
+  temperature_target_K:
+    value: 573.15
+    units: K
+    provenance: assumed
+    note: "300 degC nominal: high conversion with ample margin to the sintering limit."
+
+  temperature_max_K:
+    value: 823.15
+    units: K
+    provenance: literature
+    source: "Ru/Al2O3 sintering threshold, ~550 degC; irreversible activity loss above it"
+    note: "Hard constraint. The NMPC may not plan above it and the interlock trips at it."
+
+  temperature_initial_K:
+    value: 293.15
+    units: K
+    provenance: assumed
+
+  preheater_power_kw:
+    value: 25.0
+    units: kW
+    provenance: assumed
+    note: "Electric startup heater. Roughly a 1.2 h light-off from cold."
+
+  preheat_gain_W_K:
+    value: 2000.0
+    units: W/K
+    provenance: assumed
+    note: "Proportional gain of the local preheat controller."
+
+  cooling_gain_W_K:
+    value: 3000.0
+    units: W/K
+    provenance: assumed
+    note: >
+      Proportional gain of the heat-removal loop. Moioli et al. show that
+      controlling the axial heat-transfer profile is the key to a working
+      small-scale Sabatier reactor; here that whole design question is collapsed
+      into one adjustable duty.
+
+  cooling_power_max_W:
+    value: 80000.0
+    units: W
+    provenance: assumed
+    note: "Maximum heat removal, above the ~41 kW released at full feed."
+
+  cooling_setpoint_K:
+    value: 583.15
+    units: K
+    provenance: assumed
+    note: "Cooling begins 10 K above target, leaving the reactor to self-regulate below."
+
+  ambient_UA_W_K:
+    value: 45.0
+    units: W/K
+    provenance: assumed
+    note: "Insulated vessel shell loss."
+
+  auxiliary_power_kw:
+    value: 8.0
+    units: kW
+    provenance: assumed
+    note: >
+      Recycle blower, condenser and controls while lit. This is the entire
+      electrical cost of running the reactor once it is up to temperature, which
+      is why it is the plant's natural night-time load.
+
+  catalyst_deactivation_1_s:
+    value: 1.0e-8
+    units: 1/s
+    provenance: assumed
+    note: >
+      Base thermal deactivation rate, giving ~20 % activity loss over five years
+      at 300 degC and roughly 55x faster at 500 degC. Makes hot operation
+      genuinely costly rather than merely constrained.
+    uncertain: true
+    sigma: 0.40
+
+  catalyst_deactivation_T_ref_K:
+    value: 673.15
+    units: K
+    provenance: assumed
+    note: "Reference temperature for the exponential deactivation law."
+
+  catalyst_deactivation_T_scale_K:
+    value: 50.0
+    units: K
+    provenance: assumed
+    note: "Every 50 K above the reference multiplies the deactivation rate by e."
+
+  catalyst_activity_initial:
+    value: 1.0
+    units: "-"
+    provenance: assumed
+
+  feed_temperature_K:
+    value: 373.15
+    units: K
+    provenance: assumed
+    note: "Feed gas preheated by the product-gas recuperator."
+
+  feed_heat_capacity_J_mol_K:
+    value: 32.2
+    units: J/(mol K)
+    provenance: literature
+    source: "Mole-weighted cp of the stoichiometric feed near 400 K: (1 x 45 + 4 x 29)/5 for CO2 and H2 (NIST)"
+    note: >
+      Getting this wrong is easy and consequential. An earlier value of 180
+      J/(mol K) put the sensible feed load at 43 kW against 40 kW of reaction
+      heat, so the reactor could never sustain itself and the whole "nearly free
+      to run at night" property -- which the control strategy depends on --
+      quietly disappeared. The feed is four-fifths hydrogen, which has a low
+      molar heat capacity.
