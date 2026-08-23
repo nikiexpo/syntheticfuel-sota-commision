@@ -25,3 +25,6 @@ out/
 .ipynb_checkpoints/
 .vscode/
 .idea/
+
+# Personal working notes, not project material
+resources/Prompt.txt
