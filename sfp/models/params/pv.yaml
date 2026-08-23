@@ -1,0 +1,120 @@
+name: pv
+description: >
+  Fixed-tilt crystalline-silicon PV array with a central inverter. Thermal model
+  is Faiman (IEC 61853-2), which is the model PVGIS itself uses, so the array
+  model and the irradiance data come from the same family of assumptions.
+
+params:
+  capacity_kwp:
+    value: 500.0
+    units: kW_p
+    provenance: supplied
+    note: >
+      Array size is a design input from the CLI / siting sweep. 500 kWp is the
+      default reference plant used throughout the report.
+
+  gamma_power:
+    value: -0.0035
+    units: 1/K
+    provenance: literature
+    source: "Fraunhofer ISE, Photovoltaics Report 2024 -- mono-Si temperature coefficient of Pmax"
+    note: "Typical mono-Si Pmax coefficient, -0.30 to -0.40 %/K."
+    uncertain: true
+    sigma: 0.08
+    bounds: [-0.006, -0.002]
+
+  temp_ref_C:
+    value: 25.0
+    units: degC
+    provenance: literature
+    source: "IEC 61215 standard test conditions"
+
+  irradiance_ref:
+    value: 1000.0
+    units: W/m^2
+    provenance: literature
+    source: "IEC 61215 standard test conditions"
+
+  faiman_u0:
+    value: 25.0
+    units: W/(m^2 K)
+    provenance: literature
+    source: "Faiman (2008); PVGIS default for free-standing modules"
+    note: "Constant heat-loss coefficient. Roof-mounted arrays run hotter (u0 ~ 20)."
+    uncertain: true
+    sigma: 0.10
+
+  faiman_u1:
+    value: 6.84
+    units: "W s/(m^3 K)"
+    provenance: literature
+    source: "Faiman (2008); PVGIS default for free-standing modules"
+    note: "Wind-dependent heat-loss coefficient."
+    uncertain: true
+    sigma: 0.15
+
+  eta_inverter:
+    value: 0.975
+    units: "-"
+    provenance: literature
+    source: "Typical European weighted efficiency of a utility-scale central inverter"
+    uncertain: true
+    sigma: 0.01
+    bounds: [0.90, 0.995]
+
+  dc_ac_ratio:
+    value: 1.25
+    units: "-"
+    provenance: assumed
+    note: >
+      Inverter is deliberately undersized relative to the array. Standard practice
+      and important here: it means clipping happens at the inverter as well as at
+      the loads, and the planner must know about both.
+
+  soiling_loss:
+    value: 0.03
+    units: "-"
+    provenance: assumed
+    note: >
+      Annual-average soiling for a semi-arid site with periodic cleaning. The
+      PV-soiling *fault* in the fault library drives this well above nominal.
+    uncertain: true
+    sigma: 0.30
+
+  wiring_loss:
+    value: 0.02
+    units: "-"
+    provenance: assumed
+    note: "DC cabling and mismatch losses."
+
+  degradation_per_year:
+    value: 0.005
+    units: 1/yr
+    provenance: literature
+    source: "Jordan & Kurtz (2013), median c-Si degradation rate 0.5 %/yr"
+
+  age_years:
+    value: 0.0
+    units: yr
+    provenance: supplied
+    note: "Plant age at the start of the simulation; a siting/economics input."
+
+  tilt_deg:
+    value: -1.0
+    units: deg
+    provenance: supplied
+    note: >
+      Array tilt. A negative value means "choose automatically from latitude"
+      via clearsky.optimal_fixed_tilt.
+
+  surface_azimuth_deg:
+    value: 180.0
+    units: deg
+    provenance: assumed
+    note: "Due south (clockwise from true north). Optimal for northern-hemisphere Europe."
+
+  albedo:
+    value: 0.20
+    units: "-"
+    provenance: literature
+    source: "Liu & Jordan (1960); standard green-ground albedo"

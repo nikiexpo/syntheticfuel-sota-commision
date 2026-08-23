@@ -1,0 +1,80 @@
+name: aggregate
+description: >
+  PLACEHOLDER for milestone M0 only. A single lumped power-to-methane block
+  standing in for the whole chain (air contactor -> calciner -> electrolyser ->
+  Sabatier). It exists so the end-to-end pipeline -- weather, dispatch, report,
+  baseline comparison -- can be closed and tested before the real reduced-order
+  models land in M1. It is replaced, not extended.
+
+  Its one honest feature is that it has a warm-up state and a minimum load, so
+  start/stop decisions already cost something and the scheduling problem is not
+  trivially greedy. Everything else about it is an aggregate stand-in and every
+  number below is tagged accordingly.
+
+params:
+  rated_power_kw:
+    value: 350.0
+    units: kW
+    provenance: supplied
+    note: "Design input: total electrical rating of the process chain."
+
+  min_load_fraction:
+    value: 0.15
+    units: "-"
+    provenance: assumed
+    note: >
+      Below this the chain cannot run at all (set by the electrolyser's gas
+      crossover limit in the real model). Forces genuine on/off commitment.
+
+  specific_energy_kwh_per_kg:
+    value: 30.0
+    units: kWh/kg_CH4
+    provenance: assumed
+    note: >
+      Aggregate electricity per kg of methane. Built up as ~25 kWh/kg for
+      electrolysis + methanation at ~55 % LHV efficiency (CH4 LHV 13.9 kWh/kg),
+      plus ~5 kWh/kg for direct air capture at ~2 MWh/tCO2 and 2.75 kg CO2 per
+      kg CH4. Superseded by the real chain in M1.
+    uncertain: true
+    sigma: 0.10
+
+  part_load_penalty:
+    value: 0.18
+    units: "-"
+    provenance: assumed
+    note: >
+      Specific energy consumption rises at part load by this fraction at minimum
+      load, falling linearly to zero at rated. Stands in for the electrolyser
+      polarisation curve; the real model derives it from cell voltage.
+
+  warmup_time_s:
+    value: 2700.0
+    units: s
+    provenance: assumed
+    note: >
+      Time constant to reach full production from cold. Represents the kiln's
+      thermal inertia, which dominates the real chain's start-up cost.
+
+  cooldown_time_s:
+    value: 14400.0
+    units: s
+    provenance: assumed
+    note: "Time constant for stored heat to bleed away when idle."
+
+  standby_power_kw:
+    value: 8.0
+    units: kW
+    provenance: assumed
+    note: "Parasitic load when warm but not producing (controls, instruments, purge)."
+
+  startup_energy_kwh:
+    value: 120.0
+    units: kWh
+    provenance: assumed
+    note: "Energy to bring the chain from cold to operating temperature."
+
+  max_ramp_kw_per_s:
+    value: 2.0
+    units: kW/s
+    provenance: assumed
+    note: "Aggregate ramp limit; the real chain's is set by the Sabatier thermal response."

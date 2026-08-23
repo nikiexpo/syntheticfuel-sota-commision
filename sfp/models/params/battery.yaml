@@ -1,0 +1,94 @@
+name: battery
+description: >
+  Lithium-iron-phosphate battery with a bidirectional inverter, modelled as an
+  energy reservoir with split charge/discharge efficiency and a differentiable
+  capacity-fade state. LFP is the right chemistry for a remote solar plant:
+  cycle life and thermal safety matter far more than energy density.
+
+params:
+  capacity_kwh:
+    value: 1000.0
+    units: kWh
+    provenance: supplied
+    note: "Nameplate usable energy. A design input from the CLI / siting sweep."
+
+  power_kw:
+    value: 400.0
+    units: kW
+    provenance: supplied
+    note: "Continuous charge and discharge power limit (0.4C at the default size)."
+
+  eta_charge:
+    value: 0.96
+    units: "-"
+    provenance: literature
+    source: "Typical LFP one-way DC efficiency; round trip ~0.92 with the inverter"
+    uncertain: true
+    sigma: 0.015
+    bounds: [0.85, 0.99]
+
+  eta_discharge:
+    value: 0.96
+    units: "-"
+    provenance: literature
+    source: "Typical LFP one-way DC efficiency"
+    uncertain: true
+    sigma: 0.015
+    bounds: [0.85, 0.99]
+
+  soc_min:
+    value: 0.10
+    units: "-"
+    provenance: assumed
+    note: >
+      Lower operating limit. Reserved headroom below this is what lets the plant
+      ride through a fault without a black start, so the controller treats it as
+      a hard constraint and never plans into it.
+
+  soc_max:
+    value: 0.95
+    units: "-"
+    provenance: assumed
+    note: "Upper limit; LFP calendar life suffers at a sustained 100 % SoC."
+
+  soc_initial:
+    value: 0.50
+    units: "-"
+    provenance: assumed
+    note: "Cold-start state of charge."
+
+  self_discharge_per_day:
+    value: 0.002
+    units: 1/d
+    provenance: literature
+    source: "Typical LFP self-discharge, ~2-3 %/month at 25 degC"
+
+  cycle_life:
+    value: 6000.0
+    units: cycles
+    provenance: literature
+    source: "Manufacturer LFP datasheets, 80 % capacity retention at 80 % DoD"
+    uncertain: true
+    sigma: 0.20
+
+  end_of_life_fade:
+    value: 0.20
+    units: "-"
+    provenance: literature
+    source: "Industry convention: end of life at 20 % capacity fade"
+
+  calendar_fade_per_year:
+    value: 0.015
+    units: 1/yr
+    provenance: literature
+    source: "Typical LFP calendar ageing at moderate temperature and mid SoC"
+
+  capex_per_kwh:
+    value: 250.0
+    units: EUR/kWh
+    provenance: assumed
+    note: >
+      Installed cost of storage, 2024 utility-scale. Feeds both the LCOM
+      objective and the degradation charge the controller pays per cycle.
+    uncertain: true
+    sigma: 0.20

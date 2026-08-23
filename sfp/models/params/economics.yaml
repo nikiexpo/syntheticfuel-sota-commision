@@ -1,0 +1,97 @@
+name: economics
+description: >
+  The economic performance index. The README's third observation was that
+  "efficiently" is not a well-posed objective for this plant, and it is right:
+  maximising methane, maximising energy efficiency and maximising utilisation are
+  three different policies. This file pins down one number instead -- the
+  levelised cost of methane, EUR per kg CH4 -- and every controller is judged on
+  it. It doubles as the siting tool's headline output.
+
+  Costs are 2024 European utility-scale estimates. They are assumptions, not
+  quotes, and the LCOM is therefore a comparative instrument: use it to rank
+  strategies and sites, not as a bankable cost.
+
+params:
+  discount_rate:
+    value: 0.07
+    units: 1/yr
+    provenance: assumed
+    note: "Real WACC for a merchant renewable-fuels project."
+
+  project_lifetime_years:
+    value: 25.0
+    units: yr
+    provenance: assumed
+    note: "Matches typical PV warranty life; the battery is replaced within it."
+
+  pv_capex_per_kwp:
+    value: 700.0
+    units: EUR/kW_p
+    provenance: assumed
+    note: "Installed utility-scale PV including mounting, inverter and civils."
+    uncertain: true
+    sigma: 0.20
+
+  process_capex_per_kw:
+    value: 2200.0
+    units: EUR/kW
+    provenance: assumed
+    note: >
+      Installed cost of the whole power-to-methane chain per kW of electrical
+      rating: electrolyser stack and BoP, air contactor, calciner, Sabatier
+      reactor. Dominated by the electrolyser at present-day prices.
+    uncertain: true
+    sigma: 0.30
+
+  fixed_opex_fraction:
+    value: 0.03
+    units: 1/yr
+    provenance: assumed
+    note: "Annual fixed O&M as a fraction of total capex. Higher than a PV plant alone because of the chemistry."
+
+  water_cost_per_m3:
+    value: 2.50
+    units: EUR/m^3
+    provenance: assumed
+    note: >
+      Delivered demineralised water at a remote semi-arid site. Matters more
+      than it looks: the plant needs about 2.25 kg of water per kg of methane
+      after condensate recycle.
+
+  methane_price_per_kg:
+    value: 1.80
+    units: EUR/kg
+    provenance: assumed
+    note: >
+      Value of the product. Roughly EUR 130/MWh on an LHV basis -- a green-gas
+      price with certificates, not a wholesale natural-gas price. Used as the
+      revenue term in the controller's objective.
+    uncertain: true
+    sigma: 0.25
+
+  startup_cost_EUR:
+    value: 40.0
+    units: EUR
+    provenance: assumed
+    note: >
+      Wear-and-tear charge per process start, over and above the start-up
+      energy. Represents thermal-cycling damage to the kiln refractory and the
+      Sabatier catalyst. This is what stops the controller chasing every cloud.
+
+  curtailment_penalty_per_kwh:
+    value: 0.0
+    units: EUR/kWh
+    provenance: assumed
+    note: >
+      Deliberately zero. Off-grid there is no counterfactual buyer for curtailed
+      solar, so curtailment has no direct cost -- it is a *symptom*, reported
+      because the brief asks for it, not a term to be optimised away. Charging
+      for it would bias the controller into cycling the battery pointlessly.
+
+  co2_credit_per_kg:
+    value: 0.0
+    units: EUR/kg
+    provenance: assumed
+    note: >
+      Value of the CO2 removed from air, set to zero in the base case. A carbon
+      price is a sensitivity in the siting study, not a base-case assumption.

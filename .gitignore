@@ -1,0 +1,27 @@
+# Copyrighted source papers — see resources/README.md for citations
+resources/*.pdf
+
+# Environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Caches and generated output
+.cache/
+data/cache/
+out/
+*.log
+
+# Tooling
+.pytest_cache/
+.ipynb_checkpoints/
+.vscode/
+.idea/

@@ -1,0 +1,13 @@
+# Core numerics and symbolics
+numpy>=2.0
+scipy>=1.13
+casadi>=3.6          # symbolic ROMs, and IPOPT for the NMPC from M4
+pandas>=2.2
+pyyaml>=6.0          # provenance-tagged parameter files
+
+# Data and reporting
+requests>=2.31       # PVGIS client
+matplotlib>=3.8
+
+# Development
+pytest>=8.0
