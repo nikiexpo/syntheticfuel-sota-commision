@@ -20,12 +20,12 @@ tags. If a number is used by a model, it appears below.
 
 | Provenance | Count | Share |
 | --- | ---: | ---: |
-| `supplied` | 6 | 13 % |
-| `measured` | 0 | 0 % |
-| `literature` | 14 | 30 % |
-| `assumed` | 26 | 57 % |
+| `supplied` | 7 | 5 % |
+| `measured` | 1 | 1 % |
+| `literature` | 37 | 27 % |
+| `assumed` | 90 | 67 % |
 | `invented` | 0 | 0 % |
-| **total** | **46** | |
+| **total** | **135** | |
 
 ## What this ledger does not cover
 
@@ -55,23 +55,6 @@ be tagged on a parameter. They are recorded here explicitly:
 
 ## Parameters by subsystem
 
-### `aggregate`
-
-PLACEHOLDER for milestone M0 only. A single lumped power-to-methane block standing in for the whole chain (air contactor -> calciner -> electrolyser -> Sabatier). It exists so the end-to-end pipeline -- weather, dispatch, report, baseline comparison -- can be closed and tested before the real reduced-order models land in M1. It is replaced, not extended.
-Its one honest feature is that it has a warm-up state and a minimum load, so start/stop decisions already cost something and the scheduling problem is not trivially greedy. Everything else about it is an aggregate stand-in and every number below is tagged accordingly.
-
-| Parameter | Value | Units | Provenance | Source / note |
-| --- | ---: | --- | --- | --- |
-| `rated_power_kw` | 350 | kW | `supplied` | Design input: total electrical rating of the process chain. |
-| `cooldown_time_s` | 14400 | s | `assumed` | Time constant for stored heat to bleed away when idle. |
-| `max_ramp_kw_per_s` | 2 | kW/s | `assumed` | Aggregate ramp limit; the real chain's is set by the Sabatier thermal response. |
-| `min_load_fraction` | 0.15 | - | `assumed` | Below this the chain cannot run at all (set by the electrolyser's gas crossover limit in the real model). Forces genuine on/off commitment. |
-| `part_load_penalty` | 0.18 | - | `assumed` | Specific energy consumption rises at part load by this fraction at minimum load, falling linearly to zero at rated. Stands in for the electrolyser polarisation curve; the real model derives it from cell voltage. |
-| `specific_energy_kwh_per_kg` | 30 | kWh/kg_CH4 | `assumed` | Aggregate electricity per kg of methane. Built up as ~25 kWh/kg for electrolysis + methanation at ~55 % LHV efficiency (CH4 LHV 13.9 kWh/kg), plus ~5 kWh/kg for direct air capture at ~2 MWh/tCO2 and 2.75 kg CO2 per kg CH4. Superseded by the real chain in M1. *(perturbed in the truth simulator, sigma=10%)* |
-| `standby_power_kw` | 8 | kW | `assumed` | Parasitic load when warm but not producing (controls, instruments, purge). |
-| `startup_energy_kwh` | 120 | kWh | `assumed` | Energy to bring the chain from cold to operating temperature. |
-| `warmup_time_s` | 2700 | s | `assumed` | Time constant to reach full production from cold. Represents the kiln's thermal inertia, which dominates the real chain's start-up cost. |
-
 ### `battery`
 
 Lithium-iron-phosphate battery with a bidirectional inverter, modelled as an energy reservoir with split charge/discharge efficiency and a differentiable capacity-fade state. LFP is the right chemistry for a remote solar plant: cycle life and thermal safety matter far more than energy density.
@@ -91,6 +74,73 @@ Lithium-iron-phosphate battery with a bidirectional inverter, modelled as an ene
 | `soc_max` | 0.95 | - | `assumed` | Upper limit; LFP calendar life suffers at a sustained 100 % SoC. |
 | `soc_min` | 0.1 | - | `assumed` | Lower operating limit. Reserved headroom below this is what lets the plant ride through a fault without a black start, so the controller treats it as a hard constraint and never plans into it. |
 
+### `buffers`
+
+Gas storage between the subsystems, plus the water balance.
+These are the buffers that decouple the plant in time, and their sizes tell the story the project is about. The hydrogen tank holds ~6 h of production and the CO2 tank ~6 h, each needing a pressure vessel. The solid CaCO3 inventory holds roughly 12 h of CO2 demand in an unpressurised pile of rock. Storing a mole of CO2 as CaCO3 costs almost nothing; storing it as compressed gas costs a vessel. That asymmetry is why the control strategy banks carbon in the solid phase and keeps the gas buffers small.
+
+| Parameter | Value | Units | Provenance | Source / note |
+| --- | ---: | --- | --- | --- |
+| `h2_storage_pressure_bar` | 30 | bar | `literature` | PEM electrolysers commonly deliver 30 bar directly, avoiding a first compression stage. Delivered at stack pressure, so no hydrogen compressor is modelled. |
+| `co2_capacity_mol` | 6000 | mol | `assumed` | About 264 kg of CO2, ~8 h of Sabatier demand. Deliberately small: the cheap place to store carbon is as CaCO3, and an oversized gas buffer would hide that. |
+| `co2_compressor_kJ_per_mol` | 17.5 | kJ/mol | `assumed` | Work to raise CO2 from the calciner's 0.3 atm to the reactor's ~5 bar. Isothermal ideal work is n R T ln(p2/p1) = 7.0 kJ/mol at 300 K; a multistage intercooled machine at ~60 % isothermal efficiency gives about 17.5 kJ/mol, or 3.5 kW at the reference CO2 rate. Small but not zero, and it scales with calcination rate rather than with time. *(perturbed in the truth simulator, sigma=25%)* |
+| `co2_initial_fraction` | 0.2 | - | `assumed` |  |
+| `co2_min_fraction` | 0.02 | - | `assumed` |  |
+| `condensate_recovery` | 0.95 | - | `assumed` | Fraction of the Sabatier reactor's product water recovered by the condenser and returned to the feed tank. The Sabatier reaction makes 2 mol H2O per mol CH4 while electrolysis consumed 4, so recovery roughly halves the net make-up: about 2.36 kg of water per kg of methane instead of 4.5. *(perturbed in the truth simulator, sigma=5%)* |
+| `h2_capacity_mol` | 30000 | mol | `assumed` | About 60 kg of H2, or 8.3 h of the reactor at full feed. At 30 bar and 300 K that is a ~25 m^3 vessel. Sized deliberately at 113 % of a summer day's electrolyser output (26,400 mol). An earlier 20,000 mol tank held only 76 % of a day, so it filled every afternoon and forced the electrolyser to stop while the sun was still up -- the buffer was too small to do the one job it exists for. This is the single sizing decision that most affects whether the plant can run through the night. |
+| `h2_initial_fraction` | 0.3 | - | `assumed` |  |
+| `h2_min_fraction` | 0.05 | - | `assumed` | Cushion gas: the reactor cannot draw the tank completely empty. |
+| `water_capacity_kg` | 5000 | kg | `assumed` | 5 m^3 demineralised water tank, roughly a week of net make-up at full production. At a remote arid site this is delivered by road, which is why it carries a real cost in the objective. |
+| `water_initial_fraction` | 0.7 | - | `assumed` |  |
+| `water_makeup_rate_kg_s` | 0 | kg/s | `assumed` | Continuous make-up, zero in the base case: the tank is filled by delivery, not by a pipeline. Consumption is tracked so the report can cost it. |
+| `water_min_fraction` | 0.05 | - | `assumed` | Pump NPSH limit; the electrolyser trips below this. |
+
+### `calciner`
+
+Electrically heated rotary kiln: CaCO3 -> CaO + CO2 at about 900 degC. The single largest and most flexible electrical load in the plant, and the reason the scheduling problem is interesting.
+Two properties dominate. First, the reaction has a sharp thermodynamic threshold -- below the temperature at which the equilibrium CO2 pressure exceeds the kiln's operating pressure, nothing happens at all. Second, the refractory has enormous thermal mass, so reaching that threshold from cold costs hundreds of kWh and takes hours. Together they turn "should the kiln run today?" into a genuine unit-commitment decision rather than a set-point choice.
+
+| Parameter | Value | Units | Provenance | Source / note |
+| --- | ---: | --- | --- | --- |
+| `heater_power_rated_kw` | 150 | kW | `supplied` | Deliberately oversized relative to the steady-state CO2 demand (~70 kW). The excess capacity is what lets the kiln absorb midday solar surplus and bank CO2 -- it is the charging power of the chemical battery, and sizing it is one of the design questions the siting tool should answer. |
+| `baker_exponent_K` | 20474 | K | `literature` | Baker (1962) -- exponent of the CaCO3/CaO equilibrium correlation |
+| `baker_prefactor_atm` | 4.137e+07 | atm | `literature` | Baker (1962), J. Chem. Soc. -- CaCO3 decomposition equilibrium, p_eq = 4.137e7 exp(-20474/T) atm. Gives p_eq = 1 atm at 1170 K (897 degC), the textbook calcination temperature. |
+| `kinetic_activation_J_mol` | 120000 | J/mol | `literature` | Typical apparent activation energy for CaCO3 decomposition, 100-170 kJ/mol *(perturbed in the truth simulator, sigma=20%)* |
+| `solids_heat_capacity_J_kg_K` | 1000 | J/(kg K) | `literature` | CaCO3 specific heat capacity, ~0.9-1.1 kJ/(kg K) over 100-900 degC |
+| `calcination_rate_max_mol_s` | 0.45 | mol/s | `assumed` | Maximum solids throughput, about 2.2x the Sabatier reactor's steady CO2 demand. Set by the screw feeder and kiln residence time, not by chemistry. |
+| `feedstock_reference_mol` | 500 | mol | `assumed` | CaCO3 inventory below which the calciner rate tapers, representing the kiln running out of feed. Small relative to the 50 kmol total inventory. |
+| `heat_loss_UA_W_K` | 17 | W/K | `assumed` | Shell loss coefficient, giving ~15 kW standing loss at 900 degC against a 20 degC ambient. The time constant C/UA is about 49 h, so the kiln stays warm overnight -- holding it costs ~180 kWh over 12 h, against ~162 kWh to reheat it after letting it drift. Those being nearly equal is what makes the overnight hold/cool decision genuinely non-obvious. *(perturbed in the truth simulator, sigma=20%)* |
+| `heater_efficiency` | 0.95 | - | `assumed` | Electrical resistance heating into the kiln shell. *(perturbed in the truth simulator, sigma=3%)* |
+| `kinetic_prefactor_1_s` | 220700 | 1/s | `assumed` | Lumped rate constant folding in particle size, surface area and heat transfer to the solids. Normalised so the Arrhenius factor reaches unity at the 1173 K target: combined with the thermodynamic driving force the kiln becomes productive at ~1092 K and saturates near 1200 K. Calibrated, not measured -- the absolute rate is a design assumption, while its temperature *shape* comes from Baker's equilibrium and a literature activation energy. *(perturbed in the truth simulator, sigma=30%)* |
+| `operating_pressure_atm` | 0.3 | atm | `assumed` | CO2 partial pressure in the calciner. Sub-atmospheric operation (steam sweep or vacuum) lowers the calcination threshold from ~900 degC to ~819 degC, which is a real and commonly used design lever. It sets the temperature at which the kiln becomes productive at all. |
+| `solids_feed_temperature_K` | 373.15 | K | `assumed` | Solids enter preheated by the recuperator on the CaO return leg. |
+| `standby_power_kw` | 3 | kW | `assumed` | Drives, seals and instrumentation while the kiln is energised. |
+| `temperature_initial_K` | 293.15 | K | `assumed` | Cold start at ambient. |
+| `temperature_max_K` | 1273.15 | K | `assumed` | Refractory limit, 1000 degC. A hard constraint the NMPC may not cross. |
+| `temperature_target_K` | 1173.15 | K | `assumed` | Nominal operating temperature, 900 degC. |
+| `thermal_capacity_J_K` | 3e+06 | J/K | `assumed` | Lumped refractory plus solids holdup, about 3 t of refractory at 1.0 kJ/(kg K). Heating from ambient to 900 degC takes ~2.6 GJ = 728 kWh, which at rated power is a 4.9 hour cold start. *(perturbed in the truth simulator, sigma=15%)* |
+| `wind_loss_coefficient` | 0.6 | W/(K (m/s)) | `assumed` | Additional convective shell loss per unit wind speed. |
+
+### `contactor`
+
+Direct-air-capture contactor: ambient air is blown through a bed of CaO and CO2 is fixed as CaCO3. Electrically it is the cheapest step in the plant -- fans only, no heat -- which is precisely why the control strategy wants to run it whenever air is available and bank the result.
+The interesting physics is that capture and fan power scale differently with airflow. Capture rises roughly linearly with flow but the single-pass capture fraction falls (less residence time), while fan power rises with the cube of flow. The result is a pronounced economic optimum well below maximum flow, and a controller that ignores it wastes most of its fan energy for a few percent more CO2.
+
+| Parameter | Value | Units | Provenance | Source / note |
+| --- | ---: | --- | --- | --- |
+| `co2_mole_fraction` | 0.00042 | mol/mol | `measured` | NOAA Global Monitoring Laboratory, global mean atmospheric CO2, 2024 |
+| `fan_exponent` | 3 | - | `literature` | Fan affinity laws: pressure ~ flow^2 on a fixed system curve, so shaft power ~ flow^3 |
+| `activation_energy_J_mol` | 20000 | J/mol | `assumed` | Apparent activation energy of ambient carbonation, giving roughly a 1.3x rate increase from 10 to 30 degC. Deliberately mild: at 420 ppm the process is limited by air throughput and sorbent surface, not by kinetics. *(perturbed in the truth simulator, sigma=25%)* |
+| `air_flow_design_m3_s` | 24 | m^3/s | `assumed` | Flow at which the single-pass capture fraction equals its design value. |
+| `air_flow_max_m3_s` | 40 | m^3/s | `assumed` | Maximum contactor airflow. Sized so that full flow can supply the Sabatier reactor's stoichiometric CO2 demand at the reference plant rating. |
+| `capture_fraction_design` | 0.65 | - | `assumed` | Single-pass CO2 capture at design flow. Sets the contactor NTU via eta = 1 - exp(-NTU). Real air contactors run 0.5-0.75 single pass. Sized so that design flow comfortably covers the Sabatier reactor's stoichiometric demand: at 0.50 the contactor could only just meet it at maximum fan power, which left the controller no room to exploit the part-flow optimum. *(perturbed in the truth simulator, sigma=12%)* |
+| `fan_idle_kw` | 0.4 | kW | `assumed` | Instrumentation and dampers while the contactor is energised but not blowing. |
+| `fan_power_rated_kw` | 20 | kW | `assumed` | Fan shaft power at maximum flow. With the capture model this gives roughly 500 kWh per tonne CO2 at full flow and 165 kWh/t at design flow -- the latter is close to the ~366 kWh/t reported for large liquid-solvent air contactors, and the spread between the two is the optimum the controller is meant to find. *(perturbed in the truth simulator, sigma=20%)* |
+| `humidity_half_saturation` | 0.3 | - | `assumed` | Relative humidity at which the moisture promotion factor reaches half its maximum. Surface water films catalyse carbonation, so a dry desert site captures measurably less than a coastal one at the same temperature. This is one of the few places where siting choice changes process performance rather than just solar yield. *(perturbed in the truth simulator, sigma=30%)* |
+| `humidity_reference` | 0.6 | - | `assumed` | Relative humidity at which the promotion factor is normalised to 1. |
+| `loading_taper` | 0.9 | - | `assumed` | Fractional sorbent loading at which the capture rate begins to taper sharply. Below this the bed behaves as if fresh; above it the remaining CaO is increasingly hard to reach. |
+| `temperature_reference_K` | 298.15 | K | `assumed` | Reference temperature for the rate correction. |
+
 ### `economics`
 
 The economic performance index. The README's third observation was that "efficiently" is not a well-posed objective for this plant, and it is right: maximising methane, maximising energy efficiency and maximising utilisation are three different policies. This file pins down one number instead -- the levelised cost of methane, EUR per kg CH4 -- and every controller is judged on it. It doubles as the siting tool's headline output.
@@ -108,6 +158,39 @@ Costs are 2024 European utility-scale estimates. They are assumptions, not quote
 | `pv_capex_per_kwp` | 700 | EUR/kW_p | `assumed` | Installed utility-scale PV including mounting, inverter and civils. *(perturbed in the truth simulator, sigma=20%)* |
 | `startup_cost_EUR` | 40 | EUR | `assumed` | Wear-and-tear charge per process start, over and above the start-up energy. Represents thermal-cycling damage to the kiln refractory and the Sabatier catalyst. This is what stops the controller chasing every cloud. |
 | `water_cost_per_m3` | 2.5 | EUR/m^3 | `assumed` | Delivered demineralised water at a remote semi-arid site. Matters more than it looks: the plant needs about 2.25 kg of water per kg of methane after condensate recycle. |
+
+### `electrolyser`
+
+Proton-exchange-membrane water electrolyser. Structure follows Gorgun (2006), with a lumped stack thermal state added -- the paper models mole balances and voltage but not stack temperature, and temperature matters here because it moves the ohmic loss and therefore the efficiency the scheduler sees.
+PEM rather than alkaline is the right choice for an intermittent plant: it tolerates rapid ramps and cold starts in minutes rather than hours. The cost is a minimum load set by hydrogen crossover through the membrane, which is a safety limit and not negotiable.
+The scheduling-relevant behaviour is that **total efficiency peaks well below rated load**. Stack efficiency falls monotonically with current (overpotentials grow), but auxiliary load is roughly fixed, so at low load the auxiliaries dominate. The two effects cross at around 40-50 % of rating. A controller that runs the stack flat out whenever the sun is strong is leaving hydrogen on the table.
+
+| Parameter | Value | Units | Provenance | Source / note |
+| --- | ---: | --- | --- | --- |
+| `area_resistance_ohm_cm2` | 0.15 | ohm cm^2 | `literature` | Nafion-based PEM area-specific resistance at 60 degC, 0.10-0.20 ohm cm^2 *(perturbed in the truth simulator, sigma=15%)* |
+| `charge_transfer_coefficient` | 0.5 | - | `literature` | Symmetric charge-transfer coefficient, standard Butler-Volmer assumption |
+| `current_density_max_A_cm2` | 1.5 | A/cm^2 | `literature` | Typical PEM electrolyser rated current density, 1.0-2.0 A/cm^2 |
+| `current_density_min_fraction` | 0.1 | - | `literature` | PEM minimum turndown set by H2 crossover into the anode O2 stream (safety limit). Below this the hydrogen concentration in oxygen approaches the lower flammability limit. A hard constraint, never relaxed by the optimiser. |
+| `degradation_V_per_s` | 8.33e-10 | V/s | `literature` | PEM stack degradation ~3 microvolt/h at rated load (2-10 uV/h reported). Cell voltage rise. Over a 10-year life this is ~0.26 V, about 13 % efficiency loss. |
+| `faraday_efficiency` | 0.98 | - | `literature` | PEM Faradaic efficiency, typically >0.97 above minimum load |
+| `reversible_temp_coefficient_V_K` | -0.0009 | V/K | `literature` | dE/dT for water electrolysis, approx -0.9 mV/K |
+| `reversible_voltage_V` | 1.229 | V | `literature` | Standard reversible potential for water electrolysis at 298 K, 1 bar |
+| `temperature_max_K` | 353.15 | K | `literature` | Nafion membrane upper limit, ~80 degC before accelerated degradation |
+| `thermoneutral_voltage_V` | 1.481 | V | `literature` | Thermoneutral voltage (HHV basis) for water electrolysis at 298 K. Cell voltage above this generates heat, below it absorbs heat. Used directly in the stack energy balance rather than differencing large numbers. |
+| `active_area_cm2` | 1000 | cm^2 | `assumed` | Per-cell membrane area, typical of a commercial stack module. |
+| `ambient_UA_W_K` | 150 | W/K | `assumed` | Passive loss from the stack enclosure to ambient. |
+| `auxiliary_power_kw` | 15 | kW | `assumed` | Water circulation, gas drying, control and the balance of plant while the stack is energised. About 5 % of rating -- this term is what creates the part-load efficiency peak. *(perturbed in the truth simulator, sigma=20%)* |
+| `cooling_gain_W_K` | 6000 | W/K | `assumed` | Proportional gain of the stack thermal-management loop. This is a local regulatory controller, not a decision the supervisor makes -- the stack looks after its own temperature. |
+| `cooling_parasitic_fraction` | 0.02 | - | `assumed` | Pump and fan power as a fraction of heat rejected. |
+| `cooling_power_max_W` | 150000 | W | `assumed` | Maximum heat rejection of the cooling circuit. |
+| `degradation_per_start` | 2e-06 | V | `assumed` | Additional voltage rise per start/stop cycle. Cycling is measurably worse than steady operation for PEM, which is what makes the controller reluctant to chase clouds even though the stack *can* ramp fast. |
+| `exchange_current_density_A_cm2` | 0.0001 | A/cm^2 | `assumed` | Effective anode exchange current density for an iridium-oxide catalyst. Fitted so the polarisation curve gives ~1.97 V at 1.5 A/cm^2 and 60 degC, which matches commercial PEM stack data. *(perturbed in the truth simulator, sigma=40%)* |
+| `n_cells` | 105 | - | `assumed` | Cells in series. Chosen with the active area to give ~300 kW at 1.5 A/cm^2. |
+| `resistance_temp_coefficient` | -0.005 | 1/K | `assumed` | Membrane conductivity rises with temperature, so resistance falls ~0.5 %/K. This is why a warm stack is a more efficient stack, and why the controller should think twice before letting it cool. |
+| `temperature_initial_K` | 293.15 | K | `assumed` |  |
+| `temperature_setpoint_K` | 333.15 | K | `assumed` | 60 degC nominal operating temperature. |
+| `thermal_capacity_J_K` | 250000 | J/K | `assumed` | Stack plus coolant inventory. Gives a cold start of only ~2.8 kWh and a few minutes, which is the whole reason PEM suits an intermittent plant. *(perturbed in the truth simulator, sigma=20%)* |
+| `voltage_degradation_initial_V` | 0 | V | `assumed` |  |
 
 ### `pv`
 
@@ -130,3 +213,51 @@ Fixed-tilt crystalline-silicon PV array with a central inverter. Thermal model i
 | `soiling_loss` | 0.03 | - | `assumed` | Annual-average soiling for a semi-arid site with periodic cleaning. The PV-soiling *fault* in the fault library drives this well above nominal. *(perturbed in the truth simulator, sigma=30%)* |
 | `surface_azimuth_deg` | 180 | deg | `assumed` | Due south (clockwise from true north). Optimal for northern-hemisphere Europe. |
 | `wiring_loss` | 0.02 | - | `assumed` | DC cabling and mismatch losses. |
+
+### `sabatier`
+
+Fixed-bed Sabatier methanation reactor over Ru/Al2O3: CO2 + 4 H2 -> CH4 + 2 H2O, exothermic at -165 kJ/mol.
+Lumped from the three-zone axial model of Moioli, Gallandat & Zuttel (2019), which resolves the reactor as an activation zone, a heat-removal zone and a final equilibrium-approach zone. For scheduling we need only the aggregate: a hotspot temperature that must stay inside a window, and a conversion set by how close that temperature lets the reactor approach equilibrium.
+The scheduling-relevant property is that this reactor is **nearly free to run once lit**. It consumes almost no electricity -- the reaction heats itself -- so it is the natural night-time load, drawing down the hydrogen and CO2 banked during the day. Starting it, on the other hand, needs an electric preheat of ~31 kWh, and every thermal cycle ages the catalyst. Light it once and keep it lit is usually right; deciding when "usually" fails is the planner's job.
+
+| Parameter | Value | Units | Provenance | Source / note |
+| --- | ---: | --- | --- | --- |
+| `co2_feed_max_mol_s` | 0.25 | mol/s | `supplied` | Maximum CO2 feed, about 1.2x the rate that consumes the electrolyser's full hydrogen output. Sets the plant's peak methane rate at ~14.4 kg/h. |
+| `equilibrium_T50_K` | 810 | K | `literature` | Logistic fit to the CO2-methanation equilibrium conversion curve at ~5 bar and stoichiometric feed (Moioli et al. 2019, Fig. 2) . X_eq = 1/(1 + exp((T - T50)/w)). Reproduces ~0.97 at 300 degC, ~0.63 at 500 degC and ~0.45 at 550 degC. A fit, not a thermodynamic calculation -- it is used because the NMPC needs a smooth closed form, and the error against a full Gibbs minimisation is a few percent over the operating window. |
+| `equilibrium_width_K` | 70 | K | `literature` | Width of the same logistic fit |
+| `feed_heat_capacity_J_mol_K` | 32.2 | J/(mol K) | `literature` | Mole-weighted cp of the stoichiometric feed near 400 K: (1 x 45 + 4 x 29)/5 for CO2 and H2 (NIST). Getting this wrong is easy and consequential. An earlier value of 180 J/(mol K) put the sensible feed load at 43 kW against 40 kW of reaction heat, so the reactor could never sustain itself and the whole "nearly free to run at night" property -- which the control strategy depends on -- quietly disappeared. The feed is four-fifths hydrogen, which has a low molar heat capacity. |
+| `kinetic_activation_J_mol` | 80000 | J/mol | `literature` | Apparent activation energy for CO2 methanation over Ru/Al2O3, 70-95 kJ/mol *(perturbed in the truth simulator, sigma=20%)* |
+| `temperature_max_K` | 823.15 | K | `literature` | Ru/Al2O3 sintering threshold, ~550 degC; irreversible activity loss above it. Hard constraint. The NMPC may not plan above it and the interlock trips at it. |
+| `ambient_UA_W_K` | 45 | W/K | `assumed` | Insulated vessel shell loss. |
+| `auxiliary_power_kw` | 8 | kW | `assumed` | Recycle blower, condenser and controls while lit. This is the entire electrical cost of running the reactor once it is up to temperature, which is why it is the plant's natural night-time load. |
+| `catalyst_activity_initial` | 1 | - | `assumed` |  |
+| `catalyst_deactivation_1_s` | 1e-08 | 1/s | `assumed` | Base thermal deactivation rate, giving ~20 % activity loss over five years at 300 degC and roughly 55x faster at 500 degC. Makes hot operation genuinely costly rather than merely constrained. *(perturbed in the truth simulator, sigma=40%)* |
+| `catalyst_deactivation_T_ref_K` | 673.15 | K | `assumed` | Reference temperature for the exponential deactivation law. |
+| `catalyst_deactivation_T_scale_K` | 50 | K | `assumed` | Every 50 K above the reference multiplies the deactivation rate by e. |
+| `cooling_gain_W_K` | 3000 | W/K | `assumed` | Proportional gain of the heat-removal loop. Moioli et al. show that controlling the axial heat-transfer profile is the key to a working small-scale Sabatier reactor; here that whole design question is collapsed into one adjustable duty. |
+| `cooling_power_max_W` | 80000 | W | `assumed` | Maximum heat removal, above the ~41 kW released at full feed. |
+| `cooling_setpoint_K` | 583.15 | K | `assumed` | Cooling begins 10 K above target, leaving the reactor to self-regulate below. |
+| `feed_temperature_K` | 373.15 | K | `assumed` | Feed gas preheated by the product-gas recuperator. |
+| `kinetic_damkohler_ref` | 6 | - | `assumed` | Damkohler number at reference temperature and full feed, giving a ~99.8 % approach to equilibrium at design conditions. Folds catalyst loading, dispersion and residence time into one number. *(perturbed in the truth simulator, sigma=30%)* |
+| `kinetic_reference_T_K` | 573.15 | K | `assumed` | Reference temperature for the Damkohler normalisation, 300 degC. |
+| `preheat_gain_W_K` | 2000 | W/K | `assumed` | Proportional gain of the local preheat controller. |
+| `preheater_power_kw` | 25 | kW | `assumed` | Electric startup heater. Roughly a 1.2 h light-off from cold. |
+| `temperature_ignition_K` | 523.15 | K | `assumed` | 250 degC. Below this the rate is negligible and the reaction will not sustain itself -- the Arrhenius term handles the transition, this value is recorded so the controller knows where the cliff is. |
+| `temperature_initial_K` | 293.15 | K | `assumed` |  |
+| `temperature_target_K` | 573.15 | K | `assumed` | 300 degC nominal: high conversion with ample margin to the sintering limit. |
+| `thermal_capacity_J_K` | 400000 | J/K | `assumed` | Catalyst bed, vessel and internals, ~500 kg at 0.8 kJ/(kg K). Preheating from ambient to 300 degC costs about 31 kWh. *(perturbed in the truth simulator, sigma=20%)* |
+
+### `solids`
+
+The circulating calcium sorbent inventory: the plant's largest and cheapest buffer. CaO carbonates in the air contactor (cheap, ambient, fans only) and CaCO3 calcines in the kiln (900 degC, enormous). The inventory between them is captured CO2 held in solid form, and holding it costs nothing at all -- which is why it, not the battery, is the buffer that matters for riding through the night and through multi-day weather.
+Sorbent capacity decays with cycle number, so every calcination carries a long-run cost. That single fact is what separates a planning controller from a greedy one.
+
+| Parameter | Value | Units | Provenance | Source / note |
+| --- | ---: | --- | --- | --- |
+| `grasa_deactivation_constant` | 0.52 | - | `literature` | Grasa & Abanades (2006) -- deactivation constant k in X_N = 1/(kN + 1/(1-X_r)) + X_r *(perturbed in the truth simulator, sigma=15%)* |
+| `grasa_residual_conversion` | 0.075 | - | `literature` | Grasa & Abanades (2006), Ind. Eng. Chem. Res. 45, 8846 -- residual conversion X_r after many cycles. CaO conversion asymptotes here rather than falling to zero. *(perturbed in the truth simulator, sigma=15%)* |
+| `cycle_number_initial` | 5 | cycles | `assumed` | Mean cycle number at the start of a run. Nonzero because a fresh sorbent would flatter the controller: the interesting regime is a partly-aged bed where the marginal cost of a calcination is already visible. |
+| `makeup_rate_mol_s` | 0 | mol/s | `assumed` | Fresh-sorbent make-up, zero in the base case. A real plant purges spent sorbent and adds fresh limestone, which caps the mean cycle number. Left at zero so that deactivation is visible over a short run rather than masked. |
+| `n_caco3_initial_fraction` | 0.15 | - | `assumed` | Cold-start carbonation state of the inventory. |
+| `n_total_mol` | 50000 | mol | `assumed` | Total calcium inventory (CaO + CaCO3), conserved. 50 kmol is about 2.8 t as CaO or 5.0 t as CaCO3. Sized to buffer roughly 12 h of full-rate CO2 demand at an aged sorbent conversion of ~0.2. |
+| `purge_fraction` | 0 | - | `assumed` | Fraction of calcined solids purged. Zero in the base case; see make-up. |
