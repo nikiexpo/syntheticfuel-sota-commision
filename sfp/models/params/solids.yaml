@@ -61,6 +61,25 @@ params:
     uncertain: true
     sigma: 0.15
 
+  sorbent_cost_per_mol:
+    value: 0.0067
+    units: EUR/mol
+    provenance: assumed
+    note: >
+      Replacement cost of the calcium sorbent, per mole of CaO. Quicklime at
+      about EUR 120 per tonne and 56.08 g/mol gives EUR 0.0067/mol, so the whole
+      50 kmol charge is worth roughly EUR 336.
+
+      This is what the planner charges itself for advancing the mean cycle
+      number, and it is deliberately small. **The real penalty for cycling the
+      calcium loop is not this cost, it is the capacity the loop loses** -- the
+      Grasa-Abanades curve tightens the carbonate bound on every calcination, and
+      that constraint binds long before EUR 336 matters. The term is carried so
+      the objective is complete and so there is an honest place to put a larger
+      number if the sorbent price is ever revised.
+    uncertain: true
+    sigma: 0.40
+
   makeup_rate_mol_s:
     value: 0.0
     units: mol/s
