@@ -18,8 +18,16 @@ params:
     provenance: assumed
     note: >
       Total calcium inventory (CaO + CaCO3), conserved. 50 kmol is about 2.8 t as
-      CaO or 5.0 t as CaCO3. Sized to buffer roughly 12 h of full-rate CO2 demand
-      at an aged sorbent conversion of ~0.2.
+      CaO or 5.0 t as CaCO3.
+
+      What matters is not this number but n_total * X_N, since deactivation is
+      what sets usable capacity. At the initial cycle number of 5 that is
+      17,300 mol (X = 0.347), about 40 h of the reactor's 0.12 mol/s demand. By
+      cycle 20 it is 8,100 mol, about 19 h; by cycle 50, 5,600 mol, about 13 h.
+      **The solid buffer shrinks from days to hours over a season**, which is the
+      honest framing of sorbent deactivation: the penalty is capacity, not cost
+      (the whole charge is worth roughly EUR 420). A seasonal run is needed to
+      show it -- over 10 days the loop turns only ~1.7 times.
 
   n_caco3_initial_fraction:
     value: 0.15

@@ -17,10 +17,13 @@ params:
     units: kW
     provenance: supplied
     note: >
-      Deliberately oversized relative to the steady-state CO2 demand (~70 kW).
-      The excess capacity is what lets the kiln absorb midday solar surplus and
-      bank CO2 -- it is the charging power of the chemical battery, and sizing it
-      is one of the design questions the siting tool should answer.
+      Deliberately oversized relative to the steady-state CO2 demand. At the
+      reactor's 0.12 mol/s and ~258 kJ/mol (178 reaction + 80 sensible) the
+      standing requirement is only ~31 kW plus ~15 kW of shell loss, so the
+      heater is roughly 3x the average duty. That excess is what lets the kiln
+      absorb midday solar surplus and bank CO2 -- it is the charging power of the
+      chemical battery, and sizing it is one of the design questions the siting
+      tool should answer.
 
   heater_efficiency:
     value: 0.95
@@ -66,8 +69,11 @@ params:
     units: mol/s
     provenance: assumed
     note: >
-      Maximum solids throughput, about 2.2x the Sabatier reactor's steady CO2
+      Maximum solids throughput, 3.75x the reactor's 0.12 mol/s steady CO2
       demand. Set by the screw feeder and kiln residence time, not by chemistry.
+      The kiln is therefore a burst regenerator: it runs hard for a few hours on
+      surplus power and refills the CO2 buffer, rather than trickling along at
+      the reactor's rate.
 
   operating_pressure_atm:
     value: 0.30

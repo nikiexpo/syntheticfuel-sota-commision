@@ -18,8 +18,12 @@ params:
     units: m^3/s
     provenance: assumed
     note: >
-      Maximum contactor airflow. Sized so that full flow can supply the Sabatier
-      reactor's stoichiometric CO2 demand at the reference plant rating.
+      Maximum contactor airflow, giving 0.284 mol/s of capture at 20 degC and
+      60 % RH. That is 2.4x the reactor's 0.12 mol/s CO2 demand, so capture is
+      not a bottleneck and the contactor normally runs well below full flow --
+      which is the point, since fan power goes as the cube. The margin was 1.1x
+      against the reactor's earlier 0.25 mol/s cap; cutting that cap left this
+      generously oversized, and it is a candidate for the siting sweep at M7.
 
   air_flow_design_m3_s:
     value: 24.0
@@ -33,10 +37,11 @@ params:
     provenance: assumed
     note: >
       Single-pass CO2 capture at design flow. Sets the contactor NTU via
-      eta = 1 - exp(-NTU). Real air contactors run 0.5-0.75 single pass. Sized so
-      that design flow comfortably covers the Sabatier reactor's stoichiometric
-      demand: at 0.50 the contactor could only just meet it at maximum fan power,
-      which left the controller no room to exploit the part-flow optimum.
+      eta = 1 - exp(-NTU). Real air contactors run 0.5-0.75 single pass. At this
+      value design flow (60 % of maximum) captures 0.237 mol/s for 4.7 kW, so the
+      reactor's 0.12 mol/s demand is met at roughly a third of full flow -- deep
+      in the cheap part of the cubic fan curve, which is where the part-load
+      optimum the controller is meant to find actually lives.
     uncertain: true
     sigma: 0.12
     bounds: [0.10, 0.90]

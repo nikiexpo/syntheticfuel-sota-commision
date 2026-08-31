@@ -55,6 +55,7 @@ def build_plant(
     battery_kw: float,
     calciner_kw: float = 150.0,
     electrolyser_scale: float = 1.0,
+    reactor_feed_mol_s: float | None = None,
 ) -> Plant:
     """Assemble the reference plant at a given sizing.
 
@@ -64,7 +65,16 @@ def build_plant(
     before the gas buffer accumulates it, and the buffers publish their levels
     before the reactor throttles against them. `Plant` validates this at
     construction, so a wrong order raises rather than silently producing zeros.
+
+    `reactor_feed_mol_s` defaults to the value in `sabatier.yaml`, which is sized
+    against the electrolyser's round-the-clock hydrogen supply rather than
+    against the reactor's own capability -- see the note there and
+    `bookkeeping/03_SIZING.md`.
     """
+    sabatier_params = load_params("sabatier")
+    if reactor_feed_mol_s is not None:
+        sabatier_params = sabatier_params.override(co2_feed_max_mol_s=reactor_feed_mol_s)
+
     return Plant(
         {
             "pv": PVArray(load_params("pv").override(capacity_kwp=pv_kwp)),
@@ -83,7 +93,7 @@ def build_plant(
             ),
             "gas": GasBuffer(load_params("buffers")),
             "water": WaterTank(load_params("buffers")),
-            "sabatier": SabatierReactor(load_params("sabatier")),
+            "sabatier": SabatierReactor(sabatier_params),
         }
     )
 
@@ -170,7 +180,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     for controller in selected:
-        plant = build_plant(args.pv, args.battery, args.battery_power, args.calciner)
+        plant = build_plant(
+            args.pv, args.battery, args.battery_power, args.calciner,
+            reactor_feed_mol_s=args.reactor_feed,
+        )
         # Announce *before* simulating. A 10-day coupled run takes ~90 s, and
         # printing the controller name only on completion made the CLI look hung.
         print(f"--- {controller.name} " + "-" * (54 - len(controller.name)))
@@ -258,10 +271,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--lon", type=float, help="longitude, degrees east")
     run.add_argument("--altitude", type=float, default=0.0, help="site altitude, m")
     run.add_argument("--tilt", type=float, default=-1.0, help="array tilt, deg (-1 = auto from latitude)")
-    run.add_argument("--pv", type=float, default=500.0, help="array capacity, kWp")
+    run.add_argument("--pv", type=float, default=1100.0, help="array capacity, kWp")
     run.add_argument("--battery", type=float, default=1000.0, help="battery energy, kWh")
     run.add_argument("--battery-power", type=float, default=400.0, help="battery power, kW")
     run.add_argument("--calciner", type=float, default=150.0, help="calciner heater rating, kW")
+    run.add_argument(
+        "--reactor-feed",
+        type=float,
+        default=None,
+        help="Sabatier max CO2 feed, mol/s (default: from sabatier.yaml, 0.12)",
+    )
     run.add_argument("--days", type=float, default=10.0, help="simulation length, days")
     run.add_argument("--start-day", type=int, default=172, help="day of year to start (172 = 21 June)")
     run.add_argument("--dt", type=float, default=60.0, help="plant integration step, s")

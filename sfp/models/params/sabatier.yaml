@@ -18,12 +18,32 @@ description: >
 
 params:
   co2_feed_max_mol_s:
-    value: 0.25
+    value: 0.12
     units: mol/s
     provenance: supplied
     note: >
-      Maximum CO2 feed, about 1.2x the rate that consumes the electrolyser's
-      full hydrogen output. Sets the plant's peak methane rate at ~14.4 kg/h.
+      Maximum CO2 feed: the round-the-clock methanation rate that the
+      electrolyser can actually sustain. Overridable per run (--reactor-feed),
+      which is why this is a design input rather than an assumption.
+
+      Sized from the hydrogen supply, not from the reactor's own capability. The
+      electrolyser makes at most 0.80 mol/s of H2, and only while there is sun --
+      about 14 h at a southern European midsummer. That is 40,300 mol H2 per day,
+      which spread over a full 24 h supports 0.117 mol/s of CO2 at the 4:1
+      stoichiometry. Rounded to 0.12. Peak methane rate 6.9 kg/h.
+
+      **An earlier value of 0.25 mol/s was the sizing defect that stopped the
+      hydrogen buffer working at all.** At 0.25 the reactor demands 1.0 mol/s of
+      H2 against an electrolyser that can deliver 0.80, so the consumer outruns
+      the producer at every instant and at any state of charge. The tank can then
+      only fill if the controller deliberately holds the reactor back, so in a
+      10-day audit it sat pinned on its 5 % cushion (fill 0.051 min, 0.115 mean)
+      and time-shifted nothing. The reactor meanwhile averaged 37 % of its cap,
+      because nothing could feed it more. Cutting the cap costs no production --
+      it was never reachable -- and turns the tank from a pipe into a buffer.
+
+      At 0.12 mol/s a full night needs 17,300 mol of H2 against 28,500 mol of
+      usable tank, a 1.6x margin. See bookkeeping/03_SIZING.md for the audit.
 
   thermal_capacity_J_K:
     value: 400000.0

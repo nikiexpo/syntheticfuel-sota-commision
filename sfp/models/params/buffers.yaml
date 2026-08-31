@@ -17,15 +17,21 @@ params:
     units: mol
     provenance: assumed
     note: >
-      About 60 kg of H2, or 8.3 h of the reactor at full feed. At 30 bar and
-      300 K that is a ~25 m^3 vessel.
+      About 60 kg of H2. At 30 bar and 300 K that is a ~25 m^3 vessel.
 
-      Sized deliberately at 113 % of a summer day's electrolyser output
-      (26,400 mol). An earlier 20,000 mol tank held only 76 % of a day, so it
-      filled every afternoon and forced the electrolyser to stop while the sun
-      was still up -- the buffer was too small to do the one job it exists for.
-      This is the single sizing decision that most affects whether the plant can
-      run through the night.
+      Two independent checks, and it passes both. Against consumption: the
+      reactor at 0.12 mol/s CO2 draws 0.48 mol/s of H2, so a 10 h night needs
+      17,300 mol against 28,500 mol usable above the cushion -- a 1.6x margin,
+      which is 17.4 h of continuous night operation. Against production: it holds
+      113 % of a summer day's electrolyser output, so the stack is never forced
+      to stop on a full tank while the sun is still up. An earlier 20,000 mol
+      vessel failed that second test at 76 % of a day.
+
+      Note that adequate volume was never the binding issue. Under the reactor's
+      earlier 0.25 mol/s feed cap this tank sat pinned on its 5 % cushion for an
+      entire 10-day run, because the reactor could outrun the electrolyser at
+      every instant regardless of how much storage sat between them. The fix was
+      the feed cap, not the vessel. See bookkeeping/03_SIZING.md.
 
   h2_initial_fraction:
     value: 0.30
@@ -51,9 +57,14 @@ params:
     units: mol
     provenance: assumed
     note: >
-      About 264 kg of CO2, ~8 h of Sabatier demand. Deliberately small: the
-      cheap place to store carbon is as CaCO3, and an oversized gas buffer would
-      hide that.
+      About 264 kg of CO2, 13.6 h of the reactor's 0.12 mol/s demand above the
+      cushion. Deliberately small: the cheap place to store carbon is as CaCO3,
+      and an oversized gas buffer would hide that.
+
+      This is the buffer that already behaves as intended -- in a 10-day audit it
+      swung 0.02 to 0.92 daily, filled by the kiln in bursts and drained by the
+      reactor overnight. It is the existence proof that the storage architecture
+      works when the flows either side of a buffer are correctly sized.
 
   co2_initial_fraction:
     value: 0.20
