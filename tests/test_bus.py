@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sfp.cli import build_plant
+from sfp.cli import build_plant, build_reference_plant
 from sfp.sim.bus import CONTROLLABLE, SHED_ORDER, Request, reconcile
 
 DT = 60.0
@@ -32,7 +32,7 @@ WEATHER = {
 
 @pytest.fixture(scope="module")
 def plant():
-    return build_plant(800.0, 1500.0, 400.0)
+    return build_reference_plant()
 
 
 def _state(plant, soc: float = 0.5, kiln_K: float = 1173.15, reactor_K: float = 573.15):

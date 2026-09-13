@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sfp.cli import build_plant
+from sfp.cli import build_plant, build_reference_plant
 from sfp.control.baselines import GreedyController, RuleBasedController
 from sfp.economics import Economics
 from sfp.report.metrics import compute_metrics
@@ -42,7 +42,7 @@ def config() -> SimulationConfig:
 def runs(weather, config):
     out = {}
     for controller in (GreedyController(), RuleBasedController()):
-        result = simulate(build_plant(800.0, 1500.0, 400.0), controller, weather, config)
+        result = simulate(build_reference_plant(), controller, weather, config)
         out[controller.name] = (result, compute_metrics(result, Economics()))
     return out
 
@@ -68,7 +68,7 @@ def test_plant_validates_coupling_order():
 
 
 def test_reference_plant_order_is_valid():
-    plant = build_plant(800.0, 1500.0, 400.0)
+    plant = build_reference_plant()
     assert plant.n_states == 16
     assert list(plant.subsystems) == [
         "pv", "battery", "solids", "contactor", "calciner",
@@ -121,20 +121,28 @@ def test_greedy_vents_hydrogen_it_paid_to_make(runs):
     assert rule_vented / max(rule_produced, 1e-9) < vented / max(produced, 1e-9)
 
 
-def test_greedy_fails_to_commit_the_kiln_from_cold(runs):
+def test_greedy_barely_commits_the_kiln_from_cold(runs):
     """A real failure mode of power-follow control, worth pinning.
 
     The kiln needs about five hours of sustained power to cross its calcination
     threshold. Greedy spreads whatever is available across all four subsystems at
-    once, so the kiln creeps up and falls back overnight and never gets there.
-    Over a two-day cold start it therefore calcines nothing at all and the plant
-    runs only on its initial CO2 charge.
+    once, so it creeps up, falls back overnight, and barely gets there. Over a
+    two-day cold start the plant runs mostly on its initial CO2 charge.
+
+    Stated as a *ratio* rather than an absolute. At the 800 kWp this was first
+    measured at, greedy calcined nothing whatsoever; at the reference 1100 kWp it
+    manages a little, because there is more power to spread. The absolute number
+    was therefore a fact about the array size, not about the control strategy,
+    and it broke the moment the sizing was standardised. The comparison against
+    rule-based is the finding, and it survives resizing.
     """
     _, greedy = runs["greedy"]
     _, rule = runs["rule-based"]
-    assert greedy.sorbent_cycles < 0.01
-    assert rule.sorbent_cycles > greedy.sorbent_cycles
-    assert rule.ch4_kg > 3.0 * greedy.ch4_kg
+    # measured at the reference sizing: 0.287 vs 0.073 cycles (3.9x) and
+    # 197 vs 66 kg (3.0x). Thresholds sit below those with room, so a real
+    # regression trips them but ordinary drift does not.
+    assert rule.sorbent_cycles > 3.0 * greedy.sorbent_cycles
+    assert rule.ch4_kg > 2.5 * greedy.ch4_kg
 
 
 # --------------------------------------------------------------------------
@@ -304,8 +312,8 @@ def test_limiting_subsystem_is_reported(runs):
 # reproducibility
 # --------------------------------------------------------------------------
 def test_runs_are_deterministic(weather, config):
-    a = simulate(build_plant(800.0, 1500.0, 400.0), GreedyController(), weather, config)
-    b = simulate(build_plant(800.0, 1500.0, 400.0), GreedyController(), weather, config)
+    a = simulate(build_reference_plant(), GreedyController(), weather, config)
+    b = simulate(build_reference_plant(), GreedyController(), weather, config)
     assert a.log["ch4_total_kg"].iloc[-1] == b.log["ch4_total_kg"].iloc[-1]
     assert np.allclose(a.log["battery_soc"].to_numpy(), b.log["battery_soc"].to_numpy())
 
@@ -319,7 +327,7 @@ def test_bigger_array_produces_at_least_as_much(weather, config):
 def test_fault_injection_is_refused_until_implemented(weather, config):
     with pytest.raises(NotImplementedError):
         simulate(
-            build_plant(800.0, 1500.0, 400.0),
+            build_reference_plant(),
             GreedyController(),
             weather,
             config,

@@ -12,7 +12,7 @@ import casadi as ca
 import numpy as np
 import pytest
 
-from sfp.cli import build_plant
+from sfp.cli import build_reference_plant
 from sfp.control.nmpc import ENABLE_INDEX, SETPOINT_INDEX, InnerNMPC
 from sfp.economics import Economics
 
@@ -21,7 +21,7 @@ ALL_ON = {"contactor": 1.0, "calciner": 1.0, "electrolyser": 1.0, "sabatier": 1.
 
 @pytest.fixture(scope="module")
 def plant():
-    return build_plant(1100.0, 1500.0, 750.0)
+    return build_reference_plant()
 
 
 @pytest.fixture(scope="module")
@@ -53,6 +53,24 @@ def _symbolic_inputs(plant):
 WEATHER = {"poa_global": 800.0, "ghi": 700.0, "ghi_clear": 750.0,
            "clearsky_index": 0.9, "temp_air": 25.0, "relative_humidity": 55.0,
            "wind_speed": 2.0, "pressure": 101325.0, "cos_zenith": 0.8}
+
+
+def _terminal(plant, x0, weight=0.5):
+    """Targets and inventory prices, as the hierarchical controller supplies them.
+
+    Required, not optional: lambda prices only the battery, so without these
+    nothing rewards making hydrogen or carbonate inside a one-hour horizon.
+    """
+    names = plant.state_names()
+    keys = ("gas.n_h2", "gas.n_co2", "solids.n_caco3", "battery.soc")
+    targets = {n: float(x0[names.index(n)]) for n in keys}
+    per_mol = Economics().p.methane_price_per_kg * 16.0425e-3
+    per_mol *= weight
+    kwh_per_soc = plant["battery"].nominal_energy_J / 3.6e6
+    prices = {"gas.n_h2": per_mol / 4.0, "gas.n_co2": per_mol,
+              "solids.n_caco3": per_mol,
+              "battery.soc": per_mol * kwh_per_soc / 56.4 / 2.016e-3 / 4.0}
+    return targets, prices
 
 
 # --- the symbolic plant -----------------------------------------------------
@@ -110,8 +128,10 @@ def test_state_scale_spans_the_real_magnitudes(nmpc):
 
 def test_solution_is_returned_in_physical_units(nmpc, plant, sunny_rows):
     """A missing de-scale would report battery power as a fraction, not watts."""
-    sol = nmpc.solve(0.0, _running_state(plant), np.full(nmpc.n_steps, 0.05),
-                     sunny_rows, enables=ALL_ON)
+    x0 = _running_state(plant)
+    targets, terminal = _terminal(plant, x0)
+    sol = nmpc.solve(0.0, x0, np.full(nmpc.n_steps, 0.05), sunny_rows,
+                     enables=ALL_ON, targets=targets, terminal_prices=terminal)
     assert sol.stats.success, sol.stats.status
     p_max = plant["battery"].max_power_W
     assert 0.0 <= sol.battery_charge_W <= p_max + 1.0
@@ -142,8 +162,11 @@ def test_commitment_is_fixed_not_optimised(nmpc):
 
 
 def test_a_shut_down_subsystem_stays_off(nmpc, plant, sunny_rows):
-    sol = nmpc.solve(0.0, _running_state(plant), np.full(nmpc.n_steps, 0.05),
-                     sunny_rows, enables={**ALL_ON, "calciner": 0.0})
+    x0 = _running_state(plant)
+    targets, terminal = _terminal(plant, x0)
+    sol = nmpc.solve(0.0, x0, np.full(nmpc.n_steps, 0.05), sunny_rows,
+                     enables={**ALL_ON, "calciner": 0.0},
+                     targets=targets, terminal_prices=terminal)
     assert sol.stats.success, sol.stats.status
     assert sol.enables["calciner"] == 0.0
     assert sol.setpoints["calciner"] == pytest.approx(0.0, abs=1e-6)
@@ -157,8 +180,10 @@ def test_battery_does_not_charge_and_discharge_at_once(nmpc, plant, sunny_rows):
     back. The wear cost makes it strictly worse than either alone, which is how
     this formulation avoids an explicit complementarity constraint.
     """
-    sol = nmpc.solve(0.0, _running_state(plant), np.full(nmpc.n_steps, 0.05),
-                     sunny_rows, enables=ALL_ON)
+    x0 = _running_state(plant)
+    targets, terminal = _terminal(plant, x0)
+    sol = nmpc.solve(0.0, x0, np.full(nmpc.n_steps, 0.05), sunny_rows,
+                     enables=ALL_ON, targets=targets, terminal_prices=terminal)
     assert sol.stats.success, sol.stats.status
     assert min(sol.battery_charge_W, sol.battery_discharge_W) < 1e3
 
@@ -166,10 +191,12 @@ def test_battery_does_not_charge_and_discharge_at_once(nmpc, plant, sunny_rows):
 def test_it_converges_and_warm_starts_cheaply(nmpc, plant, sunny_rows):
     """A cold solve must converge, and the next must not cost more."""
     x0 = _running_state(plant)
+    targets, terminal = _terminal(plant, x0)
     prices = np.full(nmpc.n_steps, 0.05)
     nmpc._warm = None
-    first = nmpc.solve(0.0, x0, prices, sunny_rows, enables=ALL_ON)
-    second = nmpc.solve(0.0, x0, prices, sunny_rows, enables=ALL_ON)
+    kw = dict(enables=ALL_ON, targets=targets, terminal_prices=terminal)
+    first = nmpc.solve(0.0, x0, prices, sunny_rows, **kw)
+    second = nmpc.solve(0.0, x0, prices, sunny_rows, **kw)
     assert first.stats.success and second.stats.success
     assert second.stats.iterations <= first.stats.iterations
 
@@ -177,55 +204,77 @@ def test_it_converges_and_warm_starts_cheaply(nmpc, plant, sunny_rows):
 # --- the price has to change the answer -------------------------------------
 
 
-def test_a_higher_price_buys_less_energy(nmpc, plant, sunny_rows):
-    """The whole architecture rests on this: lambda must change behaviour.
+def test_a_heavier_terminal_weight_tracks_the_target_more_closely(
+        nmpc, plant, sunny_rows):
+    """The planner's inventory targets must actually pull the inner solution.
 
-    If the setpoints are identical at both prices then the price is decorative
-    and the hierarchy is a hand-off in name only.
-
-    The two prices bracket what the planner actually publishes -- it computes
-    0.00 EUR/kWh at midday when the plant is curtailing and about 0.054
-    overnight. Testing at an extreme instead (0.5, ten times realistic) drives
-    the answer to "shut everything down", which is a corner solution that an
-    interior-point method converges to poorly and which tells us nothing about
-    behaviour in the range the plant ever sees.
-
-    Terminal prices are supplied, and they are not decoration either. Without
-    them nothing in a thirty-minute horizon rewards making hydrogen -- the
-    methane it becomes is hours away -- so the electrolyser setpoint sits on a
-    flat manifold and the solver returns an arbitrary point on it. Measured that
-    way the comparison is noise, and it duly came back backwards. The terminal
-    value is what makes the local problem well-posed, which is exactly why the
-    hierarchy hands one down.
+    With a quadratic terminal penalty the lever is its weight: heavier means the
+    NMPC gives up more local profit to land nearer where the plan wants the
+    buffers. If the weight does nothing, the hand-off is decorative.
     """
     x0 = _running_state(plant)
     names = plant.state_names()
-    targets = {n: float(x0[names.index(n)]) for n in
-               ("gas.n_h2", "gas.n_co2", "solids.n_caco3", "battery.soc")}
-    price_per_mol_ch4 = Economics().p.methane_price_per_kg * 16.0425e-3
-    terminal = {
-        "gas.n_h2": price_per_mol_ch4 / 4.0,
-        "gas.n_co2": price_per_mol_ch4,
-        "solids.n_caco3": price_per_mol_ch4,
-        "battery.soc": price_per_mol_ch4 * (
-            plant["battery"].nominal_energy_J / 3.6e6) / 56.4 / 2.016e-3 / 4.0,
-    }
+    # a target the NMPC has to work to reach: more hydrogen than it starts with
+    i_h2 = names.index("gas.n_h2")
+    targets, prices = _terminal(plant, x0)
+    targets["gas.n_h2"] = float(x0[i_h2]) + 400.0
 
-    def solve_at(price):
+    def solve_at(weight):
         nmpc._warm = None
-        return nmpc.solve(0.0, x0, np.full(nmpc.n_steps, price), sunny_rows,
-                          enables=ALL_ON, targets=targets,
-                          terminal_prices=terminal)
+        nmpc.terminal_weight = weight
+        return nmpc.solve(0.0, x0, np.zeros(nmpc.n_steps), sunny_rows,
+                          enables=ALL_ON, targets=targets, terminal_prices=prices)
 
-    cheap = solve_at(0.005)
-    dear = solve_at(0.06)
-    assert cheap.stats.success, cheap.stats.status
-    assert dear.stats.success, dear.stats.status
+    try:
+        light = solve_at(0.1)
+        heavy = solve_at(10.0)
+    finally:
+        nmpc.terminal_weight = 1.0
 
-    def process_load(sol):
-        return sum(sol.setpoints[k]
-                   for k in ("calciner", "electrolyser", "contactor"))
+    assert light.stats.success, light.stats.status
+    assert heavy.stats.success, heavy.stats.status
 
-    assert process_load(dear) <= process_load(cheap) + 1e-6, (
-        "raising the price of electricity did not reduce the energy bought"
+    def miss(sol):
+        return abs(sol.states[-1][i_h2] - targets["gas.n_h2"])
+
+    assert miss(heavy) <= miss(light) + 1e-6, (
+        "a heavier terminal weight did not pull the end state nearer the target"
     )
+
+
+def test_free_energy_is_used_by_whatever_can_use_it(nmpc, plant, sunny_rows):
+    """Given something worth making, a sunny hour at zero price is absorbed.
+
+    This is the failure the first objective produced: with process power priced
+    against an enforced bus balance, curtailing was rewarded, and a closed-loop
+    run threw away 36 per cent of the array.
+
+    The assertion is on the *setpoints*, not on curtailment. Curtailment at
+    midday is largely structural here -- the electrolyser saturates at ~330 kW
+    against ~900 kW available, which is the electrolyser-limited regime the
+    sizing audit found past 1100 kWp -- so a curtailment threshold would be
+    measuring the plant, not the controller. What the controller must do is run
+    whatever *can* absorb free energy, flat out.
+
+    The targets ask for more inventory than the plant starts with, which is what
+    a planner target at midday looks like. Told instead to leave the buffers
+    where they are, the NMPC shuts down and curtails, and it is right to.
+    """
+    x0 = _running_state(plant)
+    names = plant.state_names()
+    targets, prices = _terminal(plant, x0)
+    targets["gas.n_h2"] = float(x0[names.index("gas.n_h2")]) + 600.0
+    targets["solids.n_caco3"] = float(x0[names.index("solids.n_caco3")]) + 400.0
+
+    nmpc._warm = None
+    sol = nmpc.solve(0.0, x0, np.zeros(nmpc.n_steps), sunny_rows,
+                     enables=ALL_ON, targets=targets, terminal_prices=prices)
+    assert sol.stats.success, sol.stats.status
+
+    # the electrolyser is 72 % of the plant's load and the only large sink for
+    # free electricity; the contactor is what banks carbon for later
+    assert sol.setpoints["electrolyser"] > 0.8, sol.setpoints
+    assert sol.setpoints["contactor"] > 0.8, sol.setpoints
+    # and it must not be calcining, which would undo the carbonate it was asked
+    # to bank
+    assert sol.setpoints["calciner"] < 0.1, sol.setpoints

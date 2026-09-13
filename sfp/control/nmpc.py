@@ -305,6 +305,16 @@ class InnerNMPC:
         (``"gas.n_h2"``) and value the terminal state -- they are what carries
         the planner's long view into a one-hour problem.
         """
+        if not targets or not terminal_prices:
+            raise ValueError(
+                "InnerNMPC needs terminal inventory prices. Since lambda prices "
+                "only the battery, nothing in a one-hour horizon rewards making "
+                "hydrogen or carbonate -- the methane they become is hours away "
+                "-- so without a terminal value the process setpoints sit on a "
+                "flat manifold, the solve does not converge, and any answer it "
+                "does return is arbitrary. The planner supplies these."
+            )
+
         n = self.n_steps
         dt = self.dt_s
         plant = self.plant
@@ -360,24 +370,38 @@ class InnerNMPC:
 
             # --- the local economic objective
             r_sab = step["r_ch4"]
-            process_W = step["process_W"]
             price = float(prices[min(k, len(prices) - 1)])
 
             # Battery wear is not optional here. Without it nothing in the
-            # objective depends on battery throughput -- only *process* power is
-            # priced -- so charging and discharging at once is free, and the
-            # solver duly did exactly that (635 kW in, 500 kW out, 58 kW of pure
-            # round-trip loss). The wear term is what makes simultaneous
-            # charge/discharge strictly worse than either alone, which is how
-            # this formulation avoids needing an explicit complementarity
-            # constraint between them.
+            # objective depends on battery throughput, so charging and
+            # discharging at once is free, and the solver duly did exactly that
+            # (635 kW in, 500 kW out, 58 kW of pure round-trip loss). The wear
+            # term is what makes simultaneous charge/discharge strictly worse
+            # than either alone, which is how this formulation avoids needing an
+            # explicit complementarity constraint between them.
             i_c = self._u_index("battery", 0)
-            throughput_J = (U[k][i_c] + U[k][i_c + 1]) * dt
-            efc = throughput_J / (2.0 * self._battery.nominal_energy_J)
+            charge, discharge = U[k][i_c], U[k][i_c + 1]
+            efc = (charge + discharge) * dt / (2.0 * self._battery.nominal_energy_J)
 
+            # No price on energy in the stage cost at all. Every intertemporal
+            # value lives in the terminal term, which is the only place it can
+            # be stated once.
+            #
+            # Two formulations were tried and both were wrong, in instructive
+            # ways. Pricing total *process* power -- the written formulation --
+            # double-counts against the enforced bus balance: substitute the
+            # balance and it becomes a charge of lambda on every watt of PV
+            # delivered, including watts that would otherwise be spilled, which
+            # is a standing bias toward curtailment. Moving lambda onto the
+            # battery instead fixes that but breaks something subtler: lambda is
+            # the *marginal* value of energy, and it is zero at midday precisely
+            # because the plant is already saturated and spilling. Pricing
+            # storage at the current lambda therefore says charging is worthless
+            # at noon -- exactly when the battery should be filling for the
+            # evening. Storage is worth the price at the hour it will be *used*,
+            # which a one-hour horizon cannot see and the terminal value can.
             profit = profit + dt * (
                 self.economics.p.methane_price_per_kg * r_sab * M_CH4
-                - price * process_W / 3.6e6
             ) - efc * self._battery.cost_per_efc_EUR()
 
             # --- rate limits. Real actuators move at a finite speed, and an
@@ -441,20 +465,47 @@ class InnerNMPC:
         )
 
     def _terminal_value(self, x_end, names, targets, terminal_prices):
-        """Value the end state at the planner's inventory prices.
+        """Penalise leaving the inventories away from where the plan wants them.
 
-        Without this the NMPC empties every buffer inside its own hour, which is
-        locally optimal and globally wrong -- exactly the failure the hierarchy
-        exists to prevent. The prices come from the planner, so the two layers
-        agree about what a banked mole is worth.
+        Without a terminal term the NMPC empties every buffer inside its own
+        hour, which is locally optimal and globally wrong -- exactly the failure
+        the hierarchy exists to prevent.
+
+        Quadratic in the deviation, not linear in the level. That is a deliberate
+        change from the written formulation, and it was forced by measurement.
+        A linear terminal value `pi * (x_N - x_target)` is only correct if `pi`
+        is a true constant marginal value, and it is not: the worth of another
+        kilowatt-hour in the battery falls as the battery fills, because there is
+        less and less chance of using it. Priced linearly at the full
+        methane-chain value it comes to roughly 50-80 EUR across the pack against
+        stage costs of about 5 EUR, so the objective became "charge as hard as
+        possible" by a factor of fifteen, the solution sat in a corner, and the
+        NMPC stopped converging at all.
+
+        Three variants were tried and all failed the same way -- pricing process
+        power against the enforced balance, pricing the battery at the current
+        lambda, and pricing it at a forward lambda. They differ only in which
+        large linear coefficient they use. The original converged solely because
+        a `lambda * P_process` term happened to push back against the storage
+        incentive, which is two errors cancelling rather than a formulation.
+
+        The quadratic form is standard economic-MPC practice: cheap near the
+        target, expensive far from it, bounded gradient everywhere, and it
+        respects the fact that the planner chose that target for a reason. The
+        inner layer stays free to deviate where local conditions justify it,
+        which is the whole point of not tracking a setpoint trajectory.
         """
         if not targets or not terminal_prices:
             return 0.0
-        value = 0.0
+        penalty = 0.0
         index = {name: i for i, name in enumerate(names)}
         for name, target in targets.items():
             if name not in index or name not in terminal_prices:
                 continue
-            value = value + (self.terminal_weight * float(terminal_prices[name])
-                             * (x_end[index[name]] - float(target)))
-        return value
+            i = index[name]
+            scale = max(float(self._x_scale[i]), 1e-9)
+            deviation = x_end[i] - float(target)
+            penalty = penalty + (self.terminal_weight
+                                 * float(terminal_prices[name])
+                                 * deviation * deviation / scale)
+        return -penalty

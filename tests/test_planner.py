@@ -19,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sfp.cli import build_plant
+from sfp.cli import build_reference_plant
 from sfp.control.base import ControlContext
 from sfp.control.planner import EconomicPlanner, Plan
 from sfp.control.planner_model import (
@@ -38,7 +38,7 @@ HOT_KILN_K = 1173.15
 
 @pytest.fixture(scope="module")
 def plant():
-    return build_plant(1100.0, 1500.0, 750.0)
+    return build_reference_plant()
 
 
 @pytest.fixture(scope="module")

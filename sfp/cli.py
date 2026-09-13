@@ -49,6 +49,36 @@ REFERENCE_SITES = {
 }
 
 
+#: The reference design point. **One definition, used everywhere** -- the CLI's
+#: defaults, every test fixture, and the bookkeeping scripts all read it from
+#: here.
+#:
+#: This exists because they had drifted apart: the CLI defaulted to a 1000 kWh /
+#: 400 kW battery while the tests and the sizing audit used 1500 / 750, and a
+#: closed-loop result was compared against a baseline measured on a different
+#: plant over a different window. The comparison was meaningless and it took a
+#: while to notice, because both numbers were individually correct.
+#:
+#: The values come from the material-flow audit in `bookkeeping/03_SIZING.md`.
+#: Changing anything here changes every simulation in the project, which is the
+#: point.
+REFERENCE_SIZING: dict[str, float] = {
+    "pv_kwp": 1100.0,
+    "battery_kwh": 1500.0,
+    "battery_kw": 750.0,
+    "calciner_kw": 150.0,
+}
+
+
+def build_reference_plant(**overrides) -> Plant:
+    """The reference plant. Use this anywhere a specific sizing is not the point."""
+    sizing = {**REFERENCE_SIZING, **overrides}
+    return build_plant(
+        sizing["pv_kwp"], sizing["battery_kwh"], sizing["battery_kw"],
+        sizing["calciner_kw"],
+    )
+
+
 def build_plant(
     pv_kwp: float,
     battery_kwh: float,
@@ -280,10 +310,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--lon", type=float, help="longitude, degrees east")
     run.add_argument("--altitude", type=float, default=0.0, help="site altitude, m")
     run.add_argument("--tilt", type=float, default=-1.0, help="array tilt, deg (-1 = auto from latitude)")
-    run.add_argument("--pv", type=float, default=1100.0, help="array capacity, kWp")
-    run.add_argument("--battery", type=float, default=1000.0, help="battery energy, kWh")
-    run.add_argument("--battery-power", type=float, default=400.0, help="battery power, kW")
-    run.add_argument("--calciner", type=float, default=150.0, help="calciner heater rating, kW")
+    run.add_argument("--pv", type=float, default=REFERENCE_SIZING["pv_kwp"],
+                     help="array capacity, kWp")
+    run.add_argument("--battery", type=float, default=REFERENCE_SIZING["battery_kwh"],
+                     help="battery energy, kWh")
+    run.add_argument("--battery-power", type=float, default=REFERENCE_SIZING["battery_kw"],
+                     help="battery power, kW")
+    run.add_argument("--calciner", type=float, default=REFERENCE_SIZING["calciner_kw"],
+                     help="calciner heater rating, kW")
     run.add_argument(
         "--reactor-feed",
         type=float,

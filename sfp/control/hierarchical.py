@@ -51,12 +51,21 @@ from sfp.sim.bus import Request
 #: Reduced-model states that carry value, mapped to the full state name the
 #: NMPC's terminal term uses. These are the inventories the planner has an
 #: opinion about; the fast states it eliminated are not its business.
+#:
+#: Every storable quantity appears exactly once, including the battery. The
+#: chemical buffers are priced at the methane they can become; the battery is
+#: priced from lambda -- see `_targets_from` for why it must be a *forward*
+#: lambda rather than the current one.
 TARGET_STATES: dict[str, str] = {
     "n_caco3": "solids.n_caco3",
     "n_h2": "gas.n_h2",
     "n_co2": "gas.n_co2",
     "soc": "battery.soc",
 }
+
+#: How far ahead to look for the price that makes stored energy worth having.
+#: Long enough to reach the evening from a midday solve.
+STORAGE_LOOKAHEAD_S: float = 12 * 3600.0
 
 
 class HierarchicalController(Controller):
@@ -203,8 +212,15 @@ class HierarchicalController(Controller):
         prices["gas.n_h2"] = price / 4.0
         prices["gas.n_co2"] = price
         prices["solids.n_caco3"] = price
-        battery = self.context.plant["battery"]
-        kwh_per_soc = battery.nominal_energy_J / 3.6e6
+
+        # The battery is priced through the same chain as everything else: the
+        # methane its stored energy can eventually become, at the electrolyser's
+        # specific energy. Pricing it from a forward lambda instead is arguably
+        # more principled and was tried; at 0.054 EUR/kWh across a 1500 kWh pack
+        # it puts ~81 EUR on the terminal term against stage costs of ~5 EUR, so
+        # it dominated the objective by fifteen to one, drove the solution into a
+        # corner, and stopped the NMPC converging at all.
+        kwh_per_soc = self.context.plant["battery"].nominal_energy_J / 3.6e6
         prices["battery.soc"] = price * kwh_per_soc / 56.4 / 2.016e-3 / 4.0
         return targets, prices
 
