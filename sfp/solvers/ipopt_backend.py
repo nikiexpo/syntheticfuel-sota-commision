@@ -53,7 +53,8 @@ class IpoptBackend(SolverBackend):
             print_level=print_level, warm_start=warm_start,
             linear_solver=linear_solver, **options,
         )
-        self._cache: dict[int, ca.Function] = {}
+        #: one-entry solver cache: (nlp, solver). See `_solver_for`.
+        self._cached: tuple[NLP, ca.Function] | None = None
 
     # --- construction -----------------------------------------------------
     def _solver_options(self) -> dict:
@@ -82,19 +83,39 @@ class IpoptBackend(SolverBackend):
     def _solver_for(self, nlp: NLP) -> ca.Function:
         """Build (once per problem structure) the CasADi solver object.
 
-        Cached on `id(nlp)` because a receding-horizon controller rebuilds the
-        same structure at every tick and constructing the solver dominates the
-        cost of solving it. The planner reuses one `NLP` and shifts its data, so
-        this cache hits on every tick after the first.
+        A **one-entry** cache, keyed by object identity, so that repeated solves
+        of the *same* `NLP` object reuse the solver and anything else builds a
+        fresh one.
+
+        This was a dict keyed on `id(nlp)`, and it was wrong twice over.
+
+        It leaked. Every replan builds a new `NLP`, so every replan added an
+        entry that was never evicted, and the dict held a strong reference to a
+        CasADi solver carrying the whole expression graph. A three-day run
+        reached 7.9 GB resident and was still climbing when it was killed.
+
+        Worse, it could have returned the wrong answer. The dict held the solver
+        but not the `NLP`, so an `NLP` could be collected and a new one allocated
+        at the same address -- and `id()` would collide. Weather enters the
+        problem as numeric constants baked into the expression graph, so the
+        cached solver belongs to *that replan's weather*. A collision would have
+        silently solved the wrong problem and reported success.
+
+        The premise was false as well: the docstring claimed "the planner reuses
+        one NLP and shifts its data", and it does not -- `_build` constructs a
+        fresh one every tick, so the cache never hit. It was pure cost.
         """
-        key = id(nlp)
-        if key not in self._cache:
-            self._cache[key] = ca.nlpsol(
-                f"solver_{nlp.name}", "ipopt",
-                {"x": nlp.x, "f": nlp.f, "g": nlp.g},
-                self._solver_options(),
-            )
-        return self._cache[key]
+        if self._cached is not None and self._cached[0] is nlp:
+            return self._cached[1]
+        solver = ca.nlpsol(
+            f"solver_{nlp.name}", "ipopt",
+            {"x": nlp.x, "f": nlp.f, "g": nlp.g},
+            self._solver_options(),
+        )
+        # Holding the NLP alongside the solver is what makes identity safe: the
+        # key cannot be reused while the entry exists.
+        self._cached = (nlp, solver)
+        return solver
 
     # --- solving ----------------------------------------------------------
     def solve(self, nlp: NLP, *, x0=None, lam_g0=None) -> Solution:

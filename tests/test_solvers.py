@@ -227,3 +227,47 @@ def test_infeasible_problem_reports_failure_without_raising():
     assert not sol.success
     assert sol.stats.status != ""
     assert np.all(np.isfinite(sol.x))
+
+
+# --- the solver cache -------------------------------------------------------
+
+
+def test_solver_cache_holds_only_the_current_problem():
+    """A dict keyed on `id(nlp)` leaked and could return the wrong solver.
+
+    Every replan builds a new NLP, so every replan added an entry that was never
+    evicted, each holding a CasADi solver and its whole expression graph -- a
+    three-day run reached 7.9 GB and was still climbing. And because the dict
+    held the solver but not the NLP, an NLP could be collected and a new one
+    allocated at the same address; weather is baked into the graph as constants,
+    so a collision would have silently solved a different problem and reported
+    success.
+    """
+    backend = get_backend("ipopt")
+    first = _qp(5.0)
+    backend.solve(first)
+    assert backend._cached is not None
+    assert backend._cached[0] is first
+
+    second = _qp(6.0)
+    backend.solve(second)
+    assert backend._cached[0] is second, "cache must not keep the old problem"
+
+
+def test_repeated_solves_of_one_problem_reuse_the_solver():
+    backend = get_backend("ipopt")
+    nlp = _qp(5.0)
+    backend.solve(nlp)
+    solver = backend._cached[1]
+    backend.solve(nlp)
+    assert backend._cached[1] is solver
+
+
+def test_many_problems_do_not_accumulate_solvers():
+    """The leak showed up as unbounded growth across a receding horizon."""
+    backend = get_backend("ipopt")
+    for c in range(20):
+        backend.solve(_qp(float(c)))
+    # exactly one entry, whatever the history
+    assert backend._cached is not None
+    assert isinstance(backend._cached, tuple) and len(backend._cached) == 2
