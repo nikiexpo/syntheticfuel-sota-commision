@@ -1,7 +1,7 @@
 """The economic planner (layer 2) -- the outer problem of the hierarchy.
 
-Decides, over a ten-day horizon at hourly resolution, how much energy goes into
-each chain and how much inventory to bank, re-solving every three hours on a
+Decides, over a three-day horizon on a graded time grid, how much energy goes
+into each chain and how much inventory to bank, re-solving every three hours on a
 receding horizon. It hands three things downward:
 
     inventory targets      where the buffers should be at the next tick
@@ -23,19 +23,33 @@ physics before anything depends on it. The NMPC slots underneath at M4.
 
 Structure of the NLP
 --------------------
-Multiple shooting on the reduced six-state model: the state at every hour is a
-decision variable and the dynamics are equality constraints. That is more
-variables than single shooting but far better conditioned over 240 steps, and it
-makes every buffer bound a simple box rather than a deeply nested expression.
+Multiple shooting on the reduced seven-state model: the state at every interval
+boundary is a decision variable and the dynamics are equality constraints. That
+is more variables than single shooting but far better conditioned over a long
+horizon, and it makes every buffer bound a simple box rather than a deeply nested
+expression.
 
-    variables    z_0..z_N  (6 each)      states at each hour boundary
-                 u_0..u_N-1 (11 each)    setpoints, enables, battery, curtailment
-    constraints  dynamics                z_{k+1} = RK4(z_k, u_k)
-                 bus_balance             supply == demand          <- lambda
+    variables    z_0..z_N   (7 each)     states at each interval boundary
+                 u_0..u_N-1 (14 each)    setpoints, enables, battery,
+                                         curtailment, vents, water make-up
+                 starts     (N-1)        reactor light-off epigraph
+    constraints  dynamics                z_{k+1} = RK4(z_k, u_k, dt_k)
+                 bus_balance             demand == supply          <- lambda
                  sorbent_capacity        n_CaCO3 <= n_tot * X(N)
                  commitment              setpoint <= enable
                  min_load                electrolyser >= i_min * enable
+                 start_counter           s_k >= e_k - e_{k-1}
                  initial_state           z_0 == current estimate
+
+Everything is solved in non-dimensional variables: each state is divided by a
+characteristic magnitude, each control by its own upper bound, and every
+constraint row by a characteristic scale. See `_build`.
+
+The grid is graded rather than uniform -- hourly through the first day, then
+three- and six-hourly. Only the near term is ever implemented, because the plan
+is rebuilt every three hours; the far end exists to value the terminal
+inventories. `bookkeeping/04_PLANNER_TRACTABILITY.md` records what that bought
+and what it cost.
 
 Curtailment is a free variable rather than a residue here, which is the one place
 the planner's world differs structurally from the bus's. It has to be: the
@@ -47,6 +61,7 @@ plan meets reality.
 from __future__ import annotations
 
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -58,7 +73,7 @@ from sfp.control.planner_model import COMMITTED, N_U, N_Z, PlannerModel, ui, zi
 from sfp.economics import Economics
 from sfp.sim.bus import Request
 from sfp.solvers import NLPBuilder, SolverBackend, get_backend
-from sfp.units import M_CH4
+from sfp.units import M_CH4, M_H2O
 
 #: Names the planner uses for the blocks it later reads back by name.
 BUS_BALANCE = "bus_balance"
@@ -66,20 +81,28 @@ BUS_BALANCE = "bus_balance"
 
 @dataclass
 class Plan:
-    """A solved schedule, sampled on the planner's hourly grid."""
+    """A solved schedule on the planner's (non-uniform) grid."""
 
     t0_s: float
-    dt_s: float
-    states: np.ndarray           # (N+1, 6)
-    controls: np.ndarray         # (N, 11)
+    dt_s: np.ndarray             # (N,) interval lengths, seconds
+    states: np.ndarray           # (N+1, N_Z)
+    controls: np.ndarray         # (N, N_U)
     lambda_EUR_per_kWh: np.ndarray   # (N,)
     objective_EUR: float
     solve_stats: Any = None
     horizon_s: float = 0.0
 
+    def __post_init__(self) -> None:
+        self.dt_s = np.atleast_1d(np.asarray(self.dt_s, dtype=float))
+        #: left edge of each interval, relative to t0
+        self.edges_s = np.concatenate(([0.0], np.cumsum(self.dt_s)))
+
     def index_at(self, t_s: float) -> int:
-        """Index of the planning interval containing absolute time `t_s`."""
-        k = int(np.floor((t_s - self.t0_s) / self.dt_s))
+        """Index of the planning interval containing absolute time `t_s`.
+
+        A search rather than a division, because the grid is non-uniform.
+        """
+        k = int(np.searchsorted(self.edges_s, t_s - self.t0_s, side="right")) - 1
         return int(np.clip(k, 0, len(self.controls) - 1))
 
     def control_at(self, t_s: float) -> np.ndarray:
@@ -102,24 +125,50 @@ class EconomicPlanner(Controller):
 
     name = "planner"
     description = (
-        "Economic MPC: 10-day horizon at 1 h, re-solved every 3 h, on a six-state "
-        "reduced model. Publishes the shadow price of electricity."
+        "Economic MPC: 3-day horizon on a graded grid, re-solved every 3 h, on a "
+        "seven-state reduced model. Publishes the shadow price of electricity."
+    )
+
+    #: Grid spacing, as (hours covered, interval length in hours). Near-term
+    #: decisions are the ones actually implemented, so they get the resolution;
+    #: the far end exists to value the terminal inventories correctly and can be
+    #: coarse. Three days at this grading is 24 + 16 = 40 intervals against 72
+    #: uniform ones, and the NLP cost is steeply superlinear in the step count.
+    DEFAULT_GRADING: tuple[tuple[float, float], ...] = (
+        (24.0, 1.0),    # first day, hourly
+        (48.0, 3.0),    # days 2-3, three-hourly
+        (96.0, 6.0),    # beyond, six-hourly
     )
 
     def __init__(
         self,
         *,
-        horizon_hours: int = 240,
+        #: Three days, not the seven the formulation asks for.
+        #:
+        #: 168 h was built, measured and does not converge: 56 intervals, 1238
+        #: variables, 3000 iterations and 452 s ending at a constraint violation
+        #: of 2e-3, whether warm-started from 72 h or not. 72 h converges
+        #: reliably in ~1600 iterations and ~155 s cold, and much faster warm.
+        #:
+        #: Raising this is safe -- the planner shortens its own target to the
+        #: longest horizon that converged and warns once -- but the default is
+        #: set to what works so that no run pays 452 s for a failed stage.
+        #: `bookkeeping/04_PLANNER_TRACTABILITY.md` has the measurements.
+        horizon_hours: int = 72,
         replan_interval_s: float = 3 * 3600.0,
         terminal_value_fraction: float = 0.5,
         sabatier_start_cost_EUR: float = 2.0,
         backend: SolverBackend | str = "ipopt",
         max_iter: int = 3000,
-        tol: float = 1e-5,
+        tol: float = 1e-4,
         commit_threshold: float = 0.5,
+        grading: tuple[tuple[float, float], ...] | None = None,
+        homotopy_hours: tuple[int, ...] = (24,),
         name: str | None = None,
     ) -> None:
         self.horizon_hours = int(horizon_hours)
+        self.grading = grading if grading is not None else self.DEFAULT_GRADING
+        self.homotopy_hours = tuple(int(h) for h in homotopy_hours)
         self.replan_interval_s = float(replan_interval_s)
         self.terminal_value_fraction = float(terminal_value_fraction)
         self.sabatier_start_cost_EUR = float(sabatier_start_cost_EUR)
@@ -129,6 +178,12 @@ class EconomicPlanner(Controller):
         # spends hundreds of iterations polishing a schedule whose inputs are a
         # weather forecast; the model error dwarfs the solver error by orders of
         # magnitude long before that.
+        #
+        # At the full horizon this is what decides whether there is a plan at
+        # all. Measured at 168 h, the solver reached a constraint violation of
+        # 6e-9 -- primal-feasible by any standard anyone cares about -- and then
+        # spent its whole iteration budget failing to tighten the *dual* to 1e-5.
+        # The schedule was usable; only the convergence test disagreed.
         self.tol = float(tol)
         self._backend_spec = backend
         if name:
@@ -155,6 +210,8 @@ class EconomicPlanner(Controller):
         )
         self.plan = None
         self._last_solution_x = None
+        self._target_hours = self.horizon_hours
+        self._reported_shortfalls: set[int] = set()
         self._next_replan_s = -np.inf
         self._diagnostics = {}
         self._failures = 0
@@ -203,16 +260,95 @@ class EconomicPlanner(Controller):
         started = time.perf_counter()
         model = self.model
         z0 = model.initial_state(state)
-        weather = self._forecast_rows(t, forecast)
-        n = len(weather["pv_available_W"])
-        if n == 0:
+        hourly = self._forecast_rows(t, forecast)
+        available_hours = len(hourly["pv_available_W"])
+        if available_hours == 0:
             return
 
-        nlp = self._build(n, z0, weather)
-        solution = self.backend.solve(nlp, x0=self._warm_start(nlp, n))
-        self._solves += 1
+        target = min(self._target_hours, available_hours)
+        stage_log: list[str] = []
 
-        if not solution.success:
+        def attempt(warm):
+            """Solve the horizon, warm-starting through a homotopy if cold.
+
+            The kiln ignition transient makes this genuinely non-convex, and a
+            cold solve straight at the full horizon is a lot to ask of any guess:
+            it either takes thousands of iterations or converges to a plant that
+            never calcines. Solving a short horizon first and warm-starting the
+            next from it walks the solver into the right basin cheaply. The
+            homotopy is skipped when a previous plan is available, which is the
+            usual case on a receding horizon.
+            """
+            solution = grid = solved_grid = None
+            stages = [] if warm is not None else [
+                h for h in self.homotopy_hours if h < target
+            ]
+            for hours in [*stages, target]:
+                grid = self._grid(hours)
+                weather = self._aggregate(hourly, grid)
+                nlp = self._build(len(grid), z0, weather, grid)
+
+                x0 = None
+                if warm is not None:
+                    z_w, u_w = self._resample(warm[0], warm[1], warm[2], grid)
+                    x0 = self._splice(self._pack(grid, z_w, u_w), nlp, grid,
+                                      warm[3])
+
+                stage = self.backend.solve(nlp, x0=x0)
+                stage_log.append(
+                    f"{hours}h/{len(grid)}i {stage.stats.status}"
+                    f" {stage.stats.iterations}it {stage.stats.wall_time_s:.0f}s"
+                )
+                if not stage.stats.success:
+                    break
+                solution, solved_grid = stage, grid
+                # a freshly solved stage covers its whole horizon
+                warm = (grid, *self._unpack(stage.x, len(grid)), float(np.sum(grid)))
+            return solution, solved_grid, grid
+
+        warm = self._shifted_warm_start(t)      # (grid, states, controls) or None
+        solution, solved_grid, grid = attempt(warm)
+
+        # A warm start is normally the cheapest route and occasionally the worst
+        # one: the previous plan can sit in a basin the new weather has made
+        # infeasible. Falling back to a cold solve costs one extra homotopy but
+        # recovers, where keeping the stale plan would degrade for the rest of
+        # the run and report a failure at every tick.
+        if solution is None and warm is not None:
+            stage_log.append("cold retry")
+            solution, solved_grid, grid = attempt(None)
+
+        self._solves += 1
+        self._diagnostics["plan_stages"] = " | ".join(stage_log)
+        # A later stage may have failed after an earlier one succeeded. Keep the
+        # best *converged* horizon rather than the longest attempted one -- a
+        # three-day plan that solved is worth more than a seven-day one that did
+        # not, and the grid must match the solution it came from.
+        grid = solved_grid if solution is not None else grid
+        n = len(grid)
+
+        # If the full horizon did not converge but a shorter one did, shorten the
+        # target permanently rather than re-attempting the same failure every
+        # three hours. Without this the homotopy -- which only runs on a cold
+        # start -- would be skipped on every later replan, the single full-horizon
+        # solve would fail again, and the planner would run the rest of the
+        # simulation on an ever-staler plan while reporting a failure each time.
+        if solution is not None:
+            achieved = int(round(float(np.sum(grid)) / 3600.0))
+            if achieved < target and achieved > 0:
+                self._target_hours = achieved
+                if achieved not in self._reported_shortfalls:
+                    self._reported_shortfalls.add(achieved)
+                    warnings.warn(
+                        f"planner horizon reduced to {achieved} h: the "
+                        f"{target} h problem did not converge. Plans remain "
+                        f"valid, but multi-day trades beyond {achieved} h are "
+                        f"outside what this planner can see.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+        if solution is None or not solution.success:
             self._failures += 1
             # Keep the previous plan. It is stale, but a stale price is still a
             # sensible price -- which is exactly the property price coordination
@@ -228,27 +364,30 @@ class EconomicPlanner(Controller):
         states = solution.value("z").reshape(n + 1, N_Z) * model.state_scale()
         controls = solution.value("u").reshape(n, N_U) * model.control_scale()
 
-        # Two conversions, both easy to get wrong and both pinned by tests.
+        # Three conversions, all easy to get wrong and all pinned by tests.
         #
         # 1. `lam` on a problem built with `maximise` is already the marginal
         #    value of relaxing the constraint -- no sign flip (see Solution.dual).
         # 2. The balance row was divided by `power_scale`, so its dual is EUR per
-        #    scaled unit. Dividing by the same factor returns EUR per watt; one
-        #    extra watt held for the whole interval is dt/3.6e6 kWh.
+        #    scaled unit. Dividing by the same factor returns EUR per watt.
+        # 3. One extra watt held for the whole interval is dt/3.6e6 kWh, and on a
+        #    graded grid `dt` differs per interval -- dividing by a single scalar
+        #    would report the six-hourly tail as six times cheaper than it is.
         lam_per_W = solution.dual(BUS_BALANCE) / model.power_scale()
-        lam_kWh = lam_per_W * 3.6e6 / self.dt_plan_s
+        lam_kWh = lam_per_W * 3.6e6 / grid
 
         self.plan = Plan(
             t0_s=t,
-            dt_s=self.dt_plan_s,
+            dt_s=grid,
             states=states,
             controls=controls,
             lambda_EUR_per_kWh=lam_kWh,
             objective_EUR=-solution.f,
             solve_stats=solution.stats,
-            horizon_s=n * self.dt_plan_s,
+            horizon_s=float(np.sum(grid)),
         )
         self._last_solution_x = solution.x
+        self._last_grid = grid
         self._diagnostics.update(
             plan_objective_EUR=-solution.f,
             plan_solve_time_s=time.perf_counter() - started,
@@ -256,12 +395,57 @@ class EconomicPlanner(Controller):
             plan_kkt_residual=solution.stats.kkt_residual,
             plan_solve_failed=0.0,
             plan_failures=float(self._failures),
+            plan_intervals=float(n),
             plan_lambda_mean=float(np.mean(lam_kWh)),
             plan_lambda_max=float(np.max(lam_kWh)),
         )
 
     # --- horizon data -----------------------------------------------------
     dt_plan_s: float = 3600.0
+
+    def _grid(self, horizon_hours: float) -> np.ndarray:
+        """Interval lengths in seconds for a graded grid over `horizon_hours`."""
+        intervals: list[float] = []
+        remaining = float(horizon_hours)
+        for span_h, step_h in self.grading:
+            take = min(span_h, remaining)
+            while take > 1e-9:
+                dt = min(step_h, take)
+                intervals.append(dt)
+                take -= dt
+                remaining -= dt
+            if remaining <= 1e-9:
+                break
+        # anything past the last band keeps the coarsest spacing
+        coarsest = self.grading[-1][1]
+        while remaining > 1e-9:
+            dt = min(coarsest, remaining)
+            intervals.append(dt)
+            remaining -= dt
+        return np.array(intervals, dtype=float) * 3600.0
+
+    def _aggregate(self, hourly: dict[str, np.ndarray], grid: np.ndarray) -> dict:
+        """Average the hourly forecast over each interval of the graded grid.
+
+        Averaging rather than sampling matters for the PV row. A six-hour
+        interval sampled at its left edge would take a single instantaneous
+        irradiance as the whole block's availability -- at dawn that reads as
+        near zero for six hours, and at noon as a full day of peak sun. The mean
+        preserves the energy, which is the quantity the bus balance is about.
+        """
+        edges = np.concatenate(([0.0], np.cumsum(grid))) / 3600.0
+        out: dict[str, np.ndarray] = {}
+        n_hours = len(hourly["pv_available_W"])
+        for key, values in hourly.items():
+            if key == "horizon_s":
+                continue
+            block = np.empty(len(grid))
+            for k in range(len(grid)):
+                lo = int(np.floor(edges[k]))
+                hi = max(int(np.ceil(edges[k + 1])), lo + 1)
+                block[k] = float(np.mean(values[lo:min(hi, n_hours)]))
+            out[key] = block
+        return out
 
     def _forecast_rows(self, t: float, forecast) -> dict[str, np.ndarray]:
         """Hourly exogenous inputs over the horizon, from the forecast.
@@ -272,7 +456,6 @@ class EconomicPlanner(Controller):
         confidence it does not have.
         """
         series = forecast if forecast is not None else self.context.forecast
-        horizon_s = self.horizon_hours * self.dt_plan_s
         dense = series.densify(self.dt_plan_s, None)
         offsets = dense["time_s"].to_numpy()
         start = int(np.searchsorted(offsets, t, side="right")) - 1
@@ -290,11 +473,11 @@ class EconomicPlanner(Controller):
             "relative_humidity": window["relative_humidity"].to_numpy(dtype=float),
             "wind_speed": window["wind_speed"].to_numpy(dtype=float),
             "pressure": window["pressure"].to_numpy(dtype=float),
-            "horizon_s": np.array([horizon_s]),
         }
 
     # --- NLP construction -------------------------------------------------
-    def _build(self, n: int, z0: np.ndarray, weather: dict[str, np.ndarray]):
+    def _build(self, n: int, z0: np.ndarray, weather: dict[str, np.ndarray],
+               grid: np.ndarray):
         """Assemble the planning NLP, in non-dimensional variables.
 
         Every decision variable is divided by a characteristic magnitude and
@@ -304,14 +487,22 @@ class EconomicPlanner(Controller):
         is a single norm over all of them. Unscaled, it hits the iteration limit
         with a constraint violation of order 1000; scaled, it converges.
 
+        `grid` gives each interval's length, so the horizon can be graded --
+        hourly where decisions are implemented, six-hourly out at the end where
+        the plan only has to value the terminal inventories.
+
         Rebuilt on every replan. The alternative -- one parameterised NLP whose
         data is swapped -- needs a fixed horizon length, and the horizon
         genuinely shortens as the run approaches the end of the forecast.
         """
         model = self.model
-        limits = model.limits()
+        limits = model.limits(z0, float(np.sum(grid)))
         lo, hi = limits.lower(), limits.upper()
-        dt = self.dt_plan_s
+        # z0 can sit marginally outside a freshly-computed snug bound (the plant
+        # integrates with its own clipper); widen rather than pose an infeasible
+        # initial-state row.
+        lo = np.minimum(lo, z0)
+        hi = np.maximum(hi, z0)
 
         z_scale = model.state_scale()
         u_scale = model.control_scale()
@@ -319,7 +510,22 @@ class EconomicPlanner(Controller):
         Sz, Su = ca.DM(z_scale), ca.DM(u_scale)
 
         u_lo, u_hi = self._control_bounds()
-        guess_z, guess_u = self._rollout_guess(n, z0, weather)
+        guess_z, guess_u = self._rollout_guess(n, z0, weather, grid)
+
+        # Per-interval control bounds, so the curtailment fraction can be pinned
+        # where it means nothing. With no sun, `pv * (1 - gamma)` is zero for
+        # every gamma: the variable has no effect on any constraint or on the
+        # objective, so it is a flat direction the solver is free to wander
+        # along. It also breaks the primal-side check that lambda is zero
+        # wherever curtailment is interior -- at night gamma sits at some
+        # arbitrary interior value while lambda is correctly high, which looks
+        # exactly like a broken price and is not one.
+        tiled_lo = np.tile(u_lo, (n, 1))
+        tiled_hi = np.tile(u_hi, (n, 1))
+        dark = np.asarray(weather["pv_available_W"], dtype=float) < 1.0
+        tiled_lo[dark, ui("curtail")] = 0.0
+        tiled_hi[dark, ui("curtail")] = 0.0
+        guess_u[dark, ui("curtail")] = 0.0
 
         b = NLPBuilder(f"planner_{n}h")
         zv = b.variable(
@@ -329,7 +535,7 @@ class EconomicPlanner(Controller):
         )
         uv = b.variable(
             "u", n * N_U,
-            lb=np.tile(u_lo / u_scale, n), ub=np.tile(u_hi / u_scale, n),
+            lb=(tiled_lo / u_scale).ravel(), ub=(tiled_hi / u_scale).ravel(),
             x0=(guess_u / u_scale).ravel(),
         )
 
@@ -349,6 +555,7 @@ class EconomicPlanner(Controller):
                 "pressure": float(weather["pressure"][k]),
             }
             rates = model.rates(Z[k], U[k], w)
+            dt = float(grid[k])
 
             defects.append((Z[k + 1] - model.step(Z[k], U[k], w, dt)) / Sz)
 
@@ -415,20 +622,15 @@ class EconomicPlanner(Controller):
         return b.build()
 
     def _control_bounds(self) -> tuple[np.ndarray, np.ndarray]:
-        """Physical box bounds on one control vector."""
-        model = self.model
-        lo = np.zeros(N_U)
-        hi = np.ones(N_U)
-        p_max = float(model.battery.max_power_W)
-        hi[ui("battery_charge_W")] = p_max
-        hi[ui("battery_discharge_W")] = p_max
-        # generous vent caps: they exist for feasibility, not as a real duty
-        hi[ui("h2_vent_mol_s")] = 5.0
-        hi[ui("co2_vent_mol_s")] = 5.0
-        return lo, hi
+        """Physical box bounds on one control vector.
+
+        Owned by the model, so the bounds and the scaling that divides by them
+        cannot drift apart.
+        """
+        return self.model.control_bounds()
 
     # --- initial guess ----------------------------------------------------
-    def _rollout_guess(self, n, z0, weather) -> tuple[np.ndarray, np.ndarray]:
+    def _rollout_guess(self, n, z0, weather, grid) -> tuple[np.ndarray, np.ndarray]:
         """A dynamically consistent starting point, from a simple forward pass.
 
         Two reasons this is not optional.
@@ -452,9 +654,10 @@ class EconomicPlanner(Controller):
         `test_planner_beats_its_own_initial_guess` checks that it does.
         """
         model = self.model
-        dt = self.dt_plan_s
         u_lo, u_hi = self._control_bounds()
         p_max = float(model.battery.max_power_W)
+        limits = model.limits(z0, float(np.sum(grid)))
+        lo, hi = limits.lower(), limits.upper()
 
         pv = weather["pv_available_W"]
         strong = float(np.percentile(pv[pv > 0], 40)) if np.any(pv > 0) else 0.0
@@ -472,6 +675,7 @@ class EconomicPlanner(Controller):
                 "pressure": float(weather["pressure"][k]),
             }
             u = np.zeros(N_U)
+            dt = float(grid[k])
             sunny = pv[k] >= max(strong, 1.0)
 
             # reactor: lit throughout -- it is the cheapest load and the whole
@@ -485,6 +689,14 @@ class EconomicPlanner(Controller):
             u[ui("contactor_flow")] = 0.35
             u[ui("electrolyser_on")] = 1.0 if sunny else 0.0
             u[ui("electrolyser_load")] = 0.6 if sunny else 0.0
+
+            # top the water tank back up to where it started, so the rollout does
+            # not walk it towards its floor and hand the solver a cornered guess
+            rates = model.rates(z, u, w)
+            net_water = float(rates["electrolysis"]) * M_H2O - (
+                2.0 * model.plant["water"].p.condensate_recovery
+                * float(rates["methanation"]) * M_H2O)
+            u[ui("water_makeup_kg_s")] = max(net_water, 0.0)
 
             # close the balance with the battery, then curtail the remainder
             load = float(model.total_load_W(z, u, w))
@@ -500,9 +712,11 @@ class EconomicPlanner(Controller):
             u = np.clip(u, u_lo, u_hi)
             z_next = np.asarray(model.step(z, u, w, dt), dtype=float).ravel()
 
-            # keep the rollout inside the box so the guess never starts outside
-            # its own bounds; the vents are what make that physically meaningful
-            lo, hi = model.limits().lower(), model.limits().upper()
+            # Keep the rollout inside the box so the guess never starts outside
+            # its own bounds. The overflow must be read from the *unclipped*
+            # trial step: clipping first would silently destroy the surplus and
+            # the vent -- which exists precisely to remove it -- would size to
+            # zero.
             over_h2 = max(z_next[zi("n_h2")] - hi[zi("n_h2")], 0.0)
             over_co2 = max(z_next[zi("n_co2")] - hi[zi("n_co2")], 0.0)
             if over_h2 > 0.0 or over_co2 > 0.0:
@@ -545,11 +759,112 @@ class EconomicPlanner(Controller):
         value = value + f * price * kwh / 56.4 / (2.016e-3) / 4.0
         return value
 
-    def _warm_start(self, nlp, n: int) -> np.ndarray | None:
-        """Shift the previous solution forward by one replan interval."""
-        if self._last_solution_x is None or self._last_solution_x.size != nlp.n_x:
+    def _shifted_warm_start(self, t: float):
+        """The previous plan, shifted forward so it lines up with the new `t0`.
+
+        Returns `(grid, states, controls)` in physical units, ready to be
+        re-gridded by `_resample`.
+
+        This used to return the previous solution *unshifted*, which was worse
+        than useless: the plan is a time series, the window has moved on by the
+        replan interval, and handing IPOPT a trajectory misaligned by three hours
+        starts it with the night schedule sitting where the afternoon belongs. It
+        also silently overrode the rollout guess, so every solve after the first
+        began from something worse than a cold start would have given.
+
+        The shift is a re-origin, not an index offset: the previous plan is
+        resampled from `t` onwards onto its own grid shape. Because the grading
+        is graded rather than uniform, interval `k` of the new plan is not
+        interval `k+1` of the old one, and only a time-based lookup gets that
+        right.
+        """
+        plan = self.plan
+        if plan is None:
             return None
-        return self._last_solution_x
+
+        grid = plan.dt_s
+        edges = np.concatenate(([0.0], np.cumsum(grid)))
+        mid = t + 0.5 * (edges[:-1] + edges[1:])
+
+        controls = np.stack([plan.control_at(m) for m in mid])
+        states = np.vstack([
+            plan.states[plan.index_at(t)],
+            np.stack([plan.states[min(plan.index_at(m) + 1, len(plan.states) - 1)]
+                      for m in mid]),
+        ])
+        # How far this warm start is *actually* informative. The old plan ran to
+        # `t0 + horizon`, and the new one starts at `t`, so it covers only
+        # `horizon - (t - t0)`. Beyond that `control_at` clamps to the final
+        # interval and repeats it. Reporting the old grid's full length here --
+        # which is what it did first -- told `_splice` the tail was good data and
+        # left the last replan interval as a frozen extrapolation.
+        covered = max(plan.horizon_s - (t - plan.t0_s), 0.0)
+        return grid, states, controls, covered
+
+    def _pack(self, grid: np.ndarray, states: np.ndarray, controls: np.ndarray) -> np.ndarray:
+        """Build a scaled decision vector from a physical trajectory."""
+        return np.concatenate([
+            (states / self.model.state_scale()).ravel(),
+            (controls / self.model.control_scale()).ravel(),
+            np.zeros(max(len(grid) - 1, 0)),   # start counters
+        ])
+
+    def _unpack(self, x: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+        """Inverse of `_pack`: physical states and controls from a solution."""
+        n_z = (n + 1) * N_Z
+        states = x[:n_z].reshape(n + 1, N_Z) * self.model.state_scale()
+        controls = x[n_z:n_z + n * N_U].reshape(n, N_U) * self.model.control_scale()
+        return states, controls
+
+    def _splice(self, x0: np.ndarray, nlp, grid: np.ndarray,
+                src_horizon_s: float) -> np.ndarray:
+        """Use the warm start only where it has data; the rollout beyond.
+
+        A homotopy stage extends the horizon, so the previous solution covers
+        only the front of the new grid. `_resample` fills the tail by holding the
+        source's last state and control constant, which is a trajectory where
+        nothing changes while the dynamics insist that it must -- every interval
+        out there starts as a large defect, and IPOPT went into restoration and
+        declared the problem locally infeasible.
+
+        `nlp.x0` already holds a dynamically consistent rollout over the *whole*
+        new horizon, so the tail is taken from there. The result is the previous
+        solution where it is informative and the rollout where it is not.
+        """
+        edges = np.concatenate(([0.0], np.cumsum(grid)))
+        n = len(grid)
+        out = np.array(x0, dtype=float, copy=True)
+        for k in range(n):
+            if edges[k] < src_horizon_s - 1e-6:
+                continue
+            u_lo = (n + 1) * N_Z + k * N_U
+            out[u_lo:u_lo + N_U] = nlp.x0[u_lo:u_lo + N_U]
+            z_lo = (k + 1) * N_Z
+            out[z_lo:z_lo + N_Z] = nlp.x0[z_lo:z_lo + N_Z]
+        return out
+
+    @staticmethod
+    def _resample(src_grid, states, controls, dst_grid):
+        """Move a trajectory from one grid onto another by nearest-interval lookup.
+
+        Homotopy stages and successive replans have different interval counts and
+        different spacings, so a warm start has to be *re-gridded*, not resized.
+        An earlier version truncated or padded the raw decision vector, which
+        looks harmless and is not: the vector is `[z | u | starts]`, so changing
+        the interval count moves the block boundaries and a truncation splices
+        the tail of the state block into the head of the control block. The
+        result is a warm start that is not a trajectory at all, and IPOPT spends
+        its whole budget recovering from it.
+        """
+        src_edges = np.concatenate(([0.0], np.cumsum(src_grid)))
+        dst_edges = np.concatenate(([0.0], np.cumsum(dst_grid)))
+        mid = 0.5 * (dst_edges[:-1] + dst_edges[1:])
+
+        idx = np.clip(np.searchsorted(src_edges, mid, side="right") - 1,
+                      0, len(controls) - 1)
+        new_u = controls[idx]
+        new_z = np.vstack([states[0], states[np.clip(idx + 1, 0, len(states) - 1)]])
+        return new_z, new_u
 
     # --- reporting --------------------------------------------------------
     def diagnostics(self) -> dict[str, float]:

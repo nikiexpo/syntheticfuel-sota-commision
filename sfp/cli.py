@@ -112,11 +112,20 @@ def resolve_site(args: argparse.Namespace) -> Site:
 
 
 def controllers_for(names: list[str]):
-    from sfp.control.baselines import GreedyController, RuleBasedController
+    from sfp.control.baselines import (
+        GreedyController,
+        PerfectForesightOracle,
+        RuleBasedController,
+    )
+    from sfp.control.hierarchical import HierarchicalController
+    from sfp.control.planner import EconomicPlanner
 
     registry = {
         "greedy": GreedyController,
         "rule-based": RuleBasedController,
+        "planner": EconomicPlanner,
+        "oracle": PerfectForesightOracle,
+        "hierarchical": HierarchicalController,
     }
     out = []
     for name in names:

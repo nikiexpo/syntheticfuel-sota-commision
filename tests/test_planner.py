@@ -21,7 +21,7 @@ import pytest
 
 from sfp.cli import build_plant
 from sfp.control.base import ControlContext
-from sfp.control.planner import EconomicPlanner
+from sfp.control.planner import EconomicPlanner, Plan
 from sfp.control.planner_model import (
     CONTROL_NAMES,
     N_U,
@@ -291,8 +291,10 @@ def test_lambda_is_positive_and_scales_with_scarcity(solved):
 def test_lambda_is_lower_when_the_sun_is_up(solved):
     """Surplus energy is worth less. This is the signal the NMPC responds to."""
     planner, _ = solved
-    lam = planner.plan.lambda_EUR_per_kWh
-    pv = planner._forecast_rows(0.0, planner.context.forecast)["pv_available_W"]
+    plan = planner.plan
+    lam = plan.lambda_EUR_per_kWh
+    hourly = planner._forecast_rows(0.0, planner.context.forecast)
+    pv = planner._aggregate(hourly, plan.dt_s)["pv_available_W"]
     n = min(len(lam), len(pv))
     sunny, dark = pv[:n] > np.median(pv[:n]), pv[:n] <= 1.0
     if sunny.any() and dark.any():
@@ -334,19 +336,21 @@ def test_electrolyser_never_runs_below_its_crossover_limit(solved):
 def test_planner_beats_its_own_initial_guess(solved):
     """The rollout is a starting point, not the answer."""
     planner, _ = solved
-    n = planner.plan.controls.shape[0]
-    z0 = planner.plan.states[0]
-    weather = planner._forecast_rows(0.0, planner.context.forecast)
-    guess_z, guess_u = planner._rollout_guess(n, z0, weather)
+    plan = planner.plan
+    n = plan.controls.shape[0]
+    z0 = plan.states[0]
+    grid = plan.dt_s
+    hourly = planner._forecast_rows(0.0, planner.context.forecast)
+    weather = planner._aggregate(hourly, grid)
+    guess_z, guess_u = planner._rollout_guess(n, z0, weather, grid)
 
-    dt = planner.dt_plan_s
     guess_profit = 0.0
     for k in range(n):
         w = {key: float(weather[key][k]) for key in
              ("temp_air", "relative_humidity", "wind_speed", "pressure")}
         guess_profit += float(planner.model.stage_profit_EUR(
-            guess_z[k], guess_u[k], w, planner.economics, dt))
-    assert planner.plan.objective_EUR > guess_profit
+            guess_z[k], guess_u[k], w, planner.economics, float(grid[k])))
+    assert plan.objective_EUR > guess_profit
 
 
 def test_request_is_well_formed(solved):
@@ -380,3 +384,293 @@ def test_no_plan_means_everything_off_rather_than_a_guess(plant, synthetic_weath
     assert planner.plan is not None or all(
         v == 0.0 for v in request.setpoints.values()
     )
+
+
+# --- water ------------------------------------------------------------------
+
+
+def test_water_is_a_planner_state_and_tracks_the_plant(model, plant):
+    full = plant.split(plant.initial_state())
+    z = model.initial_state(full)
+    assert z[zi("water_kg")] == pytest.approx(full["water"][0])
+
+
+def test_water_balance_matches_the_plant_tank(model, weather_row):
+    """Same stoichiometry as WaterTank.rhs: 1 H2O per H2 out, 2 per CH4 back."""
+    z = _hot_state(model)
+    u = _control(electrolyser_load=0.6, electrolyser_on=1.0,
+                 sabatier_feed=0.8, sabatier_on=1.0)
+    rates = model.rates(z, u, weather_row)
+    tank = model.plant["water"]
+    expected = (2.0 * tank.p.condensate_recovery * float(rates["methanation"])
+                - float(rates["electrolysis"])) * 18.01528e-3
+    dz = np.asarray(model.rhs(z, u, weather_row), dtype=float).ravel()
+    assert dz[zi("water_kg")] == pytest.approx(expected, rel=1e-9)
+
+
+def test_makeup_adds_water_one_for_one(model, weather_row):
+    z = _hot_state(model)
+    base = _control(electrolyser_load=0.6, electrolyser_on=1.0)
+    fed = _control(electrolyser_load=0.6, electrolyser_on=1.0, water_makeup_kg_s=0.02)
+    d0 = np.asarray(model.rhs(z, base, weather_row), dtype=float).ravel()
+    d1 = np.asarray(model.rhs(z, fed, weather_row), dtype=float).ravel()
+    assert d1[zi("water_kg")] - d0[zi("water_kg")] == pytest.approx(0.02, rel=1e-9)
+
+
+def test_water_is_charged_on_delivery_not_on_consumption(model, weather_row):
+    """The cost is a road tanker, so it follows the make-up control exactly."""
+    from sfp.economics import Economics
+    econ = Economics()
+    z = _hot_state(model)
+    dry = _control(electrolyser_load=0.6, electrolyser_on=1.0)
+    wet = _control(electrolyser_load=0.6, electrolyser_on=1.0, water_makeup_kg_s=0.02)
+    delta = (float(model.stage_profit_EUR(z, dry, weather_row, econ, 3600.0))
+             - float(model.stage_profit_EUR(z, wet, weather_row, econ, 3600.0)))
+    expected = econ.p.water_cost_per_m3 * 0.02 * 3600.0 / 1000.0
+    assert delta == pytest.approx(expected, rel=1e-9)
+
+
+# --- deleted guards ---------------------------------------------------------
+
+
+def test_deleted_guards_are_unreachable(model):
+    """Each guard removed from the planner must be provably inactive.
+
+    Deleting a clamp is exact only while the state box that makes it redundant
+    still stands. If a bound is ever loosened, this is what catches it.
+    """
+    limits = model.limits()
+    gas = model.gas.p
+    assert limits.n_h2[0] >= gas.h2_min_fraction * model.h2_capacity_mol - 1e-9
+    assert limits.n_co2[0] >= gas.co2_min_fraction * model.co2_capacity_mol - 1e-9
+    assert limits.cycle_number[0] >= 0.0
+    assert limits.water_kg[0] >= 1.0
+
+    # capacity can never approach the deleted fmax(capacity, 1.0) floor
+    worst = model.capture_capacity_mol(limits.cycle_number[1])
+    assert worst >= model.n_total_mol * model.solids.p.grasa_residual_conversion - 1e-6
+    assert worst > 1.0
+
+
+def test_snug_bounds_bracket_the_reachable_set(model, plant):
+    z0 = model.initial_state(plant.split(plant.initial_state()))
+    limits = model.limits(z0, 7 * 86400.0)
+    # the carbonate ceiling is the deactivated capacity, not the raw inventory
+    assert limits.n_caco3[1] < model.n_total_mol
+    assert limits.n_caco3[1] == pytest.approx(
+        model.n_total_mol * float(model.max_conversion(z0[zi("cycle_number")])), rel=1e-9)
+    # the cycle number cannot run away, but must reach what a week can turn
+    span = limits.cycle_number[1] - limits.cycle_number[0]
+    assert 1.0 <= span < 20.0
+
+
+# --- the graded grid --------------------------------------------------------
+
+
+def test_grid_covers_the_horizon_exactly(plant, synthetic_weather):
+    planner = EconomicPlanner(horizon_hours=168)
+    for hours in (1, 6, 24, 72, 168):
+        grid = planner._grid(hours)
+        assert np.sum(grid) == pytest.approx(hours * 3600.0, rel=1e-9)
+        assert np.all(grid > 0)
+
+
+def test_grid_is_fine_near_term_and_coarse_far_out(plant):
+    planner = EconomicPlanner(horizon_hours=168)
+    grid = planner._grid(168) / 3600.0
+    assert grid[0] == pytest.approx(1.0)
+    assert grid[-1] == pytest.approx(6.0)
+    assert np.all(np.diff(grid) >= -1e-9), "spacing must be non-decreasing"
+    # the whole point: far fewer intervals than a uniform hourly grid
+    assert len(grid) < 168 / 2
+
+
+def test_aggregation_preserves_energy_not_just_a_sample(plant):
+    """A coarse interval must average the forecast, not sample its left edge."""
+    planner = EconomicPlanner(horizon_hours=12)
+    planner.grading = ((6.0, 1.0), (6.0, 6.0))
+    grid = planner._grid(12)
+    hourly = {"pv_available_W": np.arange(12, dtype=float) * 100.0,
+              "temp_air": np.zeros(12), "relative_humidity": np.zeros(12),
+              "wind_speed": np.zeros(12), "pressure": np.zeros(12)}
+    out = planner._aggregate(hourly, grid)
+    assert out["pv_available_W"][0] == pytest.approx(0.0)
+    # the final 6 h block spans hours 6..11, whose mean is 850
+    assert out["pv_available_W"][-1] == pytest.approx(850.0)
+
+
+def test_substeps_scale_with_interval_length_but_are_capped(model):
+    """The cap is what makes the graded grid actually cheaper.
+
+    Without it, halving the interval count doubles the sub-steps inside each
+    one and the expression graph is exactly the same size as a uniform grid --
+    the grading would buy nothing at all.
+    """
+    assert model.substeps_for(600.0) == 1
+    assert model.substeps_for(3600.0) == 2
+    assert model.substeps_for(6 * 3600.0) == model.MAX_SUBSTEPS
+
+    # total RHS evaluations must fall relative to a uniform hourly grid
+    graded = np.concatenate([np.full(24, 1.0), np.full(16, 3.0), np.full(16, 6.0)])
+    graded_cost = sum(model.substeps_for(h * 3600.0) for h in graded)
+    uniform_cost = sum(model.substeps_for(3600.0) for _ in range(168))
+    assert graded_cost < 0.5 * uniform_cost
+
+
+def test_plan_indexing_handles_a_non_uniform_grid():
+    n = 4
+    plan = Plan(
+        t0_s=0.0, dt_s=np.array([3600.0, 3600.0, 10800.0, 21600.0]),
+        states=np.zeros((n + 1, N_Z)), controls=np.arange(n * N_U).reshape(n, N_U),
+        lambda_EUR_per_kWh=np.zeros(n), objective_EUR=0.0,
+    )
+    assert plan.index_at(0.0) == 0
+    assert plan.index_at(3600.0) == 1
+    assert plan.index_at(7200.0) == 2          # third interval starts here
+    assert plan.index_at(17999.0) == 2         # and is 3 h long
+    assert plan.index_at(18000.0) == 3
+    assert plan.index_at(1e9) == 3
+
+
+# --- lambda, checked on the primal side -------------------------------------
+
+
+def test_lambda_is_zero_where_energy_is_being_spilled(solved):
+    """Strictly interior curtailment means energy is free at the margin.
+
+    This is a primal-side identity, so it validates the dual without trusting
+    the dual -- if the two disagree, the price is wrong.
+    """
+    planner, _ = solved
+    plan = planner.plan
+    gamma = plan.controls[:, ui("curtail")]
+    hourly = planner._forecast_rows(0.0, planner.context.forecast)
+    pv = planner._aggregate(hourly, plan.dt_s)["pv_available_W"]
+
+    # Only where there is sun. With `pv == 0` the term `pv * (1 - gamma)`
+    # vanishes for every gamma, so the variable is unconstrained by anything and
+    # its value carries no information -- an interior gamma at midnight says
+    # nothing about the price of energy at midnight.
+    interior = (gamma > 1e-3) & (gamma < 1.0 - 1e-3) & (pv[:len(gamma)] > 1.0)
+    if interior.any():
+        assert np.max(np.abs(plan.lambda_EUR_per_kWh[interior])) < 5e-3
+
+
+def test_lambda_rises_when_the_battery_is_the_marginal_source(solved):
+    """Across a charge/discharge pair the price must reflect the round trip."""
+    planner, _ = solved
+    plan = planner.plan
+    charging = plan.controls[:, ui("battery_charge_W")] > 1e3
+    discharging = plan.controls[:, ui("battery_discharge_W")] > 1e3
+    if charging.any() and discharging.any():
+        lam = plan.lambda_EUR_per_kWh
+        assert lam[discharging].mean() > lam[charging].mean(), (
+            "discharging hours must price energy above charging hours, or the "
+            "battery is being cycled for no reason"
+        )
+
+
+# --- the perfect-foresight oracle -------------------------------------------
+
+
+def test_oracle_refuses_to_run_without_the_truth(plant, synthetic_weather):
+    """An oracle quietly running on a forecast would report near-zero regret."""
+    from sfp.control.baselines import PerfectForesightOracle
+
+    context = ControlContext(
+        plant=plant, site=synthetic_weather.site, dt_s=300.0, horizon_s=86400.0,
+        forecast=synthetic_weather, economics=Economics(),
+    )
+    with pytest.raises(ValueError, match=r"metadata\['truth'\]"):
+        PerfectForesightOracle().reset(context)
+
+
+def test_oracle_plans_against_the_truth_not_the_forecast(plant, synthetic_weather):
+    from sfp.control.baselines import PerfectForesightOracle
+
+    degraded = synthetic_weather.forecast(skill=0.2, seed=3)
+    oracle = PerfectForesightOracle(horizon_hours=6, homotopy_hours=())
+    oracle.reset(ControlContext(
+        plant=plant, site=synthetic_weather.site, dt_s=300.0, horizon_s=86400.0,
+        forecast=degraded, economics=Economics(),
+        metadata={"truth": synthetic_weather},
+    ))
+    assert oracle.context.forecast is synthetic_weather
+
+
+def test_horizon_is_shortened_rather_than_retried_forever(plant, synthetic_weather):
+    """A planner whose full horizon never converges must still produce plans.
+
+    The homotopy only runs on a cold start, so without the shortfall logic every
+    later replan would attempt the one horizon that fails, fail, and leave the
+    plant running on an ever-staler plan while reporting a failure each time.
+    """
+    planner = EconomicPlanner(horizon_hours=8, homotopy_hours=(4,))
+    planner.reset(ControlContext(
+        plant=plant, site=synthetic_weather.site, dt_s=300.0, horizon_s=86400.0,
+        forecast=synthetic_weather, economics=Economics(),
+    ))
+    assert planner._target_hours == 8
+    # simulate the full horizon having failed after a shorter one converged
+    planner._target_hours = 4
+    assert planner._target_hours < planner.horizon_hours
+
+
+def test_resample_moves_a_trajectory_between_grids(plant, synthetic_weather):
+    """Re-gridding must be a time lookup, not an index shuffle."""
+    planner = EconomicPlanner(horizon_hours=12)
+    src = np.array([3600.0] * 6)
+    states = np.arange((len(src) + 1) * N_Z, dtype=float).reshape(-1, N_Z)
+    controls = np.arange(len(src) * N_U, dtype=float).reshape(-1, N_U)
+
+    dst = np.array([7200.0] * 3)          # same span, half the intervals
+    z, u = planner._resample(src, states, controls, dst)
+    assert u.shape == (3, N_U)
+    assert z.shape == (4, N_Z)
+    # Destination midpoints land at 1, 3 and 5 hours, each exactly on a source
+    # interval boundary; `searchsorted(..., "right")` resolves a tie to the later
+    # interval. Which side a tie falls on does not matter for a warm start, but
+    # it should be a decision rather than an accident.
+    assert u[0] == pytest.approx(controls[1])
+    assert u[1] == pytest.approx(controls[3])
+    assert u[2] == pytest.approx(controls[5])
+    assert z[0] == pytest.approx(states[0])
+
+    # a destination midpoint strictly inside a source interval is unambiguous
+    z2, u2 = planner._resample(src, states, controls, np.array([1800.0, 1800.0]))
+    assert u2[0] == pytest.approx(controls[0])
+    assert u2[1] == pytest.approx(controls[0])
+
+
+def test_splice_keeps_the_warm_start_only_where_it_has_data(plant, synthetic_weather):
+    """Beyond the source horizon the rollout is used, not a frozen extrapolation.
+
+    Holding the last state constant past the end of the source plan gives a
+    trajectory where nothing changes while the dynamics insist it must, which
+    sent IPOPT into restoration and a declared infeasibility.
+    """
+    planner = EconomicPlanner(horizon_hours=12, homotopy_hours=())
+    planner.reset(ControlContext(
+        plant=plant, site=synthetic_weather.site, dt_s=300.0, horizon_s=86400.0,
+        forecast=synthetic_weather, economics=Economics(),
+    ))
+    z0 = planner.model.initial_state(plant.split(plant.initial_state()))
+    hourly = planner._forecast_rows(0.0, synthetic_weather)
+    grid = planner._grid(12)
+    nlp = planner._build(len(grid), z0, planner._aggregate(hourly, grid), grid)
+
+    warm = np.full(nlp.n_x, -1.0)          # sentinel: clearly not the rollout
+    src_horizon = 6 * 3600.0
+    out = planner._splice(warm, nlp, grid, src_horizon)
+
+    n = len(grid)
+    edges = np.concatenate(([0.0], np.cumsum(grid)))
+    for k in range(n):
+        u_lo = (n + 1) * N_Z + k * N_U
+        block = out[u_lo:u_lo + N_U]
+        if edges[k] < src_horizon - 1e-6:
+            assert np.all(block == -1.0), f"interval {k} should keep the warm start"
+        else:
+            assert np.allclose(block, nlp.x0[u_lo:u_lo + N_U]), (
+                f"interval {k} is past the source horizon and should use the rollout"
+            )

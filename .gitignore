@@ -28,6 +28,6 @@ out/
 
 # Personal working notes, not project material
 resources/Prompt.txt
-
+local/
 # Personal bookkeeping and working notes
 bookkeeping/

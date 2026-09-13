@@ -34,8 +34,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping
 
+import casadi as ca
 import numpy as np
 
+from sfp.models import mathx as mx
 from sfp.models.base import Subsystem
 
 #: Keys supplied by the weather series, always available in phase 1.
@@ -198,17 +200,29 @@ class Plant:
         return self.evaluate(t, x, u, w)[0]
 
     def rhs(self, t: float, x: np.ndarray, u: Mapping[str, np.ndarray], w: Mapping[str, Any]):
-        """Phase 2. Combined dx/dt with every coupling signal resolved."""
+        """Phase 2. Combined dx/dt with every coupling signal resolved.
+
+        Dispatches on whether anything in the assembled derivative is symbolic,
+        so the same coupled model serves the simulator numerically and the inner
+        NMPC symbolically. Forcing the numeric path (`np.asarray(..., float)`)
+        unconditionally is what would otherwise stop the controller from using
+        the plant's own equations -- and a controller with its own re-typed copy
+        of the dynamics is the thing this project exists to avoid.
+        """
         _, context = self.evaluate(t, x, u, w)
         states = self.split(x)
         parts = []
         for key, sub in self:
             if sub.n_states == 0:
                 continue
-            parts.append(
-                np.asarray(sub.rhs(t, states[key], u[key], context), dtype=float).reshape(-1)
-            )
-        return np.concatenate(parts) if parts else np.zeros(0)
+            parts.append(sub.rhs(t, states[key], u[key], context))
+        if not parts:
+            return np.zeros(0)
+        if mx.any_sym(*parts):
+            return ca.vertcat(*parts)
+        return np.concatenate(
+            [np.asarray(p, dtype=float).reshape(-1) for p in parts]
+        )
 
     def electrical_load_W(
         self, t: float, x: np.ndarray, u: Mapping[str, np.ndarray], w: Mapping[str, Any]
@@ -224,15 +238,25 @@ class Plant:
         u: Mapping[str, np.ndarray],
         w: Mapping[str, Any],
         dt: float,
+        clip: bool = True,
     ) -> np.ndarray:
-        """One fixed-step RK4 advance with a zero-order hold on `u` and `w`."""
+        """One fixed-step RK4 advance with a zero-order hold on `u` and `w`.
+
+        `clip=False` skips the projection back into the state box, which is
+        required for symbolic use: `clip_state` calls `np.array(..., dtype=float)`
+        and cannot accept a CasADi expression. It is also the *right* thing for an
+        optimiser, which enforces those bounds as explicit constraints -- clipping
+        inside the dynamics would hide a violation from the solver rather than
+        letting it see and respect the bound.
+        """
         if self.n_states == 0:
             return x
         k1 = self.rhs(t, x, u, w)
         k2 = self.rhs(t + 0.5 * dt, x + 0.5 * dt * k1, u, w)
         k3 = self.rhs(t + 0.5 * dt, x + 0.5 * dt * k2, u, w)
         k4 = self.rhs(t + dt, x + dt * k3, u, w)
-        return self.clip_state(x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4))
+        advanced = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        return self.clip_state(advanced) if clip else advanced
 
     def clip_state(self, x: np.ndarray) -> np.ndarray:
         """Project the state back into its physical box.

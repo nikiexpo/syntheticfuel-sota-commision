@@ -132,7 +132,11 @@ def simulate(
         horizon_s=config.duration_s,
         forecast=forecast,
         economics=economics,
-        metadata={"weather_provenance": weather.provenance},
+        # The truth is offered here for exactly one consumer: the perfect-
+        # foresight oracle, which is a bound rather than a controller. Any real
+        # strategy that reached for it would be cheating, and the plant/model
+        # split at M5 is what makes that distinction enforceable.
+        metadata={"weather_provenance": weather.provenance, "truth": weather},
     )
     controller.reset(context)
 

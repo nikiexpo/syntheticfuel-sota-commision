@@ -58,8 +58,17 @@ from sfp.models import mathx as mx
 from sfp.units import DH_CALCINATION, F_FARADAY, M_CACO3, M_CH4, M_H2O
 
 #: Order of the reduced state vector. Used everywhere; never index by number.
+#:
+#: `water_kg` is the seventh, added after the M3 review. It was flagged as a
+#: known omission when this model was first written and it is a real one: at the
+#: reference sizing the plant consumes about 312 kg/day net of condensate
+#: recovery, against 3250 kg usable in the tank, so the tank empties in around
+#: ten days. Over a seven-day horizon it does not bind, which is precisely why it
+#: has to be in the model -- a constraint that is nearly active is one the
+#: planner should be trading against, not one it should be blind to.
 STATE_NAMES: tuple[str, ...] = (
     "soc", "n_caco3", "cycle_number", "n_h2", "n_co2", "kiln_temperature_K",
+    "water_kg",
 )
 
 #: Order of the reduced control vector.
@@ -73,11 +82,17 @@ STATE_NAMES: tuple[str, ...] = (
 #: so the planner must be able to as well. Venting is never attractive -- it
 #: throws away methane the objective wants -- so the optimiser avoids it on its
 #: own, and a plan that vents anyway is reporting something worth reading.
+#:
+#: `water_makeup_kg_s` is a real decision: water arrives by road at a remote arid
+#: site, so scheduling deliveries is something an operator does. Making it a
+#: control rather than a fixed parameter also removes the positive part from the
+#: cost -- the delivery *is* the positive part -- and gives the tank a recourse,
+#: so a long horizon cannot become infeasible simply by running dry.
 CONTROL_NAMES: tuple[str, ...] = (
     "contactor_flow", "calciner_heat", "electrolyser_load", "sabatier_feed",
     "contactor_on", "calciner_on", "electrolyser_on", "sabatier_on",
     "battery_charge_W", "battery_discharge_W", "curtail",
-    "h2_vent_mol_s", "co2_vent_mol_s",
+    "h2_vent_mol_s", "co2_vent_mol_s", "water_makeup_kg_s",
 )
 
 #: Subsystems the planner commits, in the order their setpoint/enable pairs appear.
@@ -110,6 +125,7 @@ class PlannerLimits:
     n_h2: tuple[float, float]
     n_co2: tuple[float, float]
     kiln_temperature_K: tuple[float, float]
+    water_kg: tuple[float, float]
 
     def lower(self) -> np.ndarray:
         return np.array([getattr(self, n)[0] for n in STATE_NAMES], dtype=float)
@@ -170,24 +186,49 @@ class PlannerModel:
     def co2_capacity_mol(self) -> float:
         return float(self.gas.p.co2_capacity_mol)
 
-    def limits(self) -> PlannerLimits:
+    def limits(self, z0=None, horizon_s: float = 0.0) -> PlannerLimits:
         """Bounds the planner may not plan outside of.
 
-        The carbonate bound is the *total* inventory, not the deactivated
-        capacity: capacity depends on the cycle number, which is itself a state,
-        so that limit is imposed as a nonlinear constraint in `planner.py` rather
-        than as a box.
+        Given the current state and horizon, the two monotone states get bounds
+        snug enough to be informative rather than nominal.
+
+        **Why snugness matters here and not elsewhere.** The cycle number moves
+        by about 2 over a week but was previously bounded `[0, 1e4]`. A box three
+        orders of magnitude wider than the reachable set tells the solver nothing,
+        wastes the barrier's interior, and -- in any formulation that scales by
+        bound range -- can shrink a state's dynamics defect until it vanishes
+        inside the convergence test. The same applies to the carbonate inventory:
+        deactivation means capacity only ever falls, so `n_tot * X_N(N_0)` is a
+        hard ceiling that the nominal `n_tot` overstates by a factor of three.
+
+        The carbonate *capacity* limit proper is still a nonlinear constraint in
+        `planner.py`, because it depends on the cycle number, which is a state.
+        This box is the constant part of it.
         """
         b = self.battery.p
+        cap_kg = float(self.plant["water"].p.water_capacity_kg)
+
+        n0 = float(z0[_IZ["cycle_number"]]) if z0 is not None else \
+            float(self.solids.p.cycle_number_initial)
+        # the loop cannot turn faster than the kiln feeder allows
+        reach = (float(self.calciner.p.calcination_rate_max_mol_s)
+                 * max(horizon_s, 0.0) / self.n_total_mol)
+        caco3_ceiling = self.n_total_mol * float(self.max_conversion(n0))
+
         return PlannerLimits(
             soc=(float(b.soc_min), float(b.soc_max)),
-            n_caco3=(0.0, self.n_total_mol),
-            cycle_number=(0.0, 1e4),
+            n_caco3=(0.0, caco3_ceiling),
+            # a small margin below the current value: the cycle counter is
+            # monotone, so n0 is a true floor, but putting the initial-state
+            # equality exactly on a box face makes the barrier start on the
+            # boundary for no benefit
+            cycle_number=(max(n0 - 0.1, 0.0), n0 + max(reach, 1.0)),
             n_h2=(float(self.gas.p.h2_min_fraction) * self.h2_capacity_mol,
                   self.h2_capacity_mol),
             n_co2=(float(self.gas.p.co2_min_fraction) * self.co2_capacity_mol,
                    self.co2_capacity_mol),
             kiln_temperature_K=(250.0, float(self.calciner.p.temperature_max_K)),
+            water_kg=(float(self.plant["water"].p.water_min_fraction) * cap_kg, cap_kg),
         )
 
     def state_scale(self) -> np.ndarray:
@@ -203,24 +244,39 @@ class PlannerModel:
         """
         return np.array(
             [1.0, self.n_total_mol, 1.0,
-             self.h2_capacity_mol, self.co2_capacity_mol, 1000.0],
+             self.h2_capacity_mol, self.co2_capacity_mol, 1000.0,
+             float(self.plant["water"].p.water_capacity_kg)],
             dtype=float,
         )
+
+    def control_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        """Physical box bounds on one control vector."""
+        lo = np.zeros(N_U)
+        hi = np.ones(N_U)
+        p_max = float(self.battery.max_power_W)
+        hi[_IU["battery_charge_W"]] = p_max
+        hi[_IU["battery_discharge_W"]] = p_max
+        # The vents exist for feasibility, not as a real duty: they only ever
+        # need to carry an overflow, and the largest possible one is the
+        # electrolyser's full output.
+        hi[_IU["h2_vent_mol_s"]] = 1.0
+        hi[_IU["co2_vent_mol_s"]] = 1.0
+        # net consumption is ~3.6e-3 kg/s at full production; this is ample
+        hi[_IU["water_makeup_kg_s"]] = 0.02
+        return lo, hi
 
     def control_scale(self) -> np.ndarray:
         """Characteristic magnitude of each reduced control.
 
-        Setpoints, enables and the curtailment fraction are already fractions of
-        one. Only the battery powers (watts) and the vent rates (mol/s) need
-        rescaling.
+        Defined as the upper bound, so **every control is [0, 1] once scaled**.
+        Deriving the scale from the bound rather than picking it separately is
+        what keeps the two consistent: an earlier version scaled the water
+        make-up by 0.01 while bounding it at 0.5, which put a scaled variable on
+        a box fifty units wide in a problem where everything else lived in the
+        unit interval. That is exactly the kind of mismatch the non-dimensional
+        formulation exists to prevent, and it cost hundreds of iterations.
         """
-        scale = np.ones(N_U)
-        p_max = float(self.battery.max_power_W)
-        scale[_IU["battery_charge_W"]] = p_max
-        scale[_IU["battery_discharge_W"]] = p_max
-        scale[_IU["h2_vent_mol_s"]] = 1.0
-        scale[_IU["co2_vent_mol_s"]] = 1.0
-        return scale
+        return self.control_bounds()[1]
 
     def power_scale(self) -> float:
         """Characteristic bus power, W. Scales the balance constraint to order one."""
@@ -236,20 +292,45 @@ class PlannerModel:
                 float(plant_state["gas"][0]),
                 float(plant_state["gas"][1]),
                 float(plant_state["calciner"][0]),
+                float(plant_state["water"][0]),
             ],
             dtype=float,
         )
 
     # --- derived quantities ----------------------------------------------
+    #
+    # Guards deleted rather than smoothed
+    # -----------------------------------
+    # The plant's models clamp several quantities that a state box already makes
+    # unreachable. Deleting such a guard is strictly better than smoothing it:
+    # it is exact, it costs no variable and no row, and it removes a kink that
+    # would otherwise sit on the feasible set. Each deletion below names the box
+    # that makes it safe, because the argument is only valid while that box
+    # stands -- `test_deleted_guards_are_unreachable` re-checks them.
+    #
+    #   fmax(cycle_number, 0)      -> box  cycle_number >= N_0 >= 0
+    #   fmax(capacity, 1.0)        -> X_N >= X_r = 0.075, so capacity >= 3750 mol
+    #   fmax(n_H2 - cushion, 0)    -> box  n_H2  >= h2_min_fraction * capacity
+    #   fmax(n_CO2 - cushion, 0)   -> box  n_CO2 >= co2_min_fraction * capacity
+    #   smooth_step(water - 1, 1)  -> box  water >= water_min_fraction * capacity
+
     def max_conversion(self, cycle_number):
-        """Grasa-Abanades sorbent capacity at mean cycle number N."""
-        return self.solids.max_conversion(cycle_number)
+        """Grasa-Abanades sorbent capacity at mean cycle number N.
+
+        Written out rather than delegated to `SolidsInventory.max_conversion`
+        only to drop its `fmax(N, 0)` guard, which the cycle-number box makes
+        unreachable. Same equation otherwise.
+        """
+        x_r = self.solids.p.grasa_residual_conversion
+        k = self.solids.p.grasa_deactivation_constant
+        return 1.0 / (k * cycle_number + 1.0 / (1.0 - x_r)) + x_r
 
     def capture_capacity_mol(self, cycle_number):
         return self.n_total_mol * self.max_conversion(cycle_number)
 
     def loading(self, z):
-        capacity = mx.fmax(self.capture_capacity_mol(z[_IZ["cycle_number"]]), 1.0)
+        # capacity >= n_tot * X_r = 3750 mol, so no floor guard is needed
+        capacity = self.capture_capacity_mol(z[_IZ["cycle_number"]])
         return mx.smooth_clip(z[_IZ["n_caco3"]] / capacity, 0.0, 1.0, eps=1e-4)
 
     # --- rates ------------------------------------------------------------
@@ -340,16 +421,29 @@ class PlannerModel:
         # --- reactor: conversion at the regulated temperature, throttled by
         # whichever buffer is short. `smooth_min` replaces the plant's `fmin`;
         # the 1e-3 width is a thousandth of a fractional availability.
+        # The cushion guards are deleted: the tank boxes put both differences at
+        # or above zero everywhere on the feasible set. The water gate goes the
+        # same way, since `water_kg >= 250` is now a state box.
         sab = self.sabatier
-        co2_free = mx.smooth_max(
-            z[_IZ["n_co2"]] - self.gas.p.co2_min_fraction * self.co2_capacity_mol,
-            0.0, eps=1.0)
-        h2_free = mx.smooth_max(
-            z[_IZ["n_h2"]] - self.gas.p.h2_min_fraction * self.h2_capacity_mol,
-            0.0, eps=1.0)
+        co2_free = z[_IZ["n_co2"]] - self.gas.p.co2_min_fraction * self.co2_capacity_mol
+        h2_free = z[_IZ["n_h2"]] - self.gas.p.h2_min_fraction * self.h2_capacity_mol
+        # Two different widths, because the two operators fail in opposite ways.
+        #
+        # The *clips* get 1e-2 rather than the plant's 1e-3. Deleting the cushion
+        # guards helped the gradient but moved the sharpest curvature inward:
+        # what the guard used to smooth over ~1 mol, the clip now turns over in
+        # 0.05 mol of CO2 -- a near-discontinuity sitting on the tank's own lower
+        # box, which is exactly where a starved reactor operates.
+        #
+        # The *min* keeps 1e-3, because `smooth_min` is biased low by eps/2
+        # wherever its arguments are equal -- and they are equal, at exactly 1.0,
+        # whenever both buffers are comfortable, which is most of the time. At
+        # 1e-2 that is a systematic 0.5 % under-prediction of the reactor rate
+        # across the whole plan: small, invisible, and in the direction that
+        # would quietly make the planner pessimistic about its own product.
         availability = mx.smooth_min(
-            mx.smooth_clip(co2_free / 50.0, 0.0, 1.0, eps=1e-3),
-            mx.smooth_clip(h2_free / 200.0, 0.0, 1.0, eps=1e-3),
+            mx.smooth_clip(co2_free / 50.0, 0.0, 1.0, eps=1e-2),
+            mx.smooth_clip(h2_free / 200.0, 0.0, 1.0, eps=1e-2),
             eps=1e-3,
         )
         conversion = sab.conversion(self._x_sabatier, mx.vertcat(feed, 1.0))
@@ -442,6 +536,13 @@ class PlannerModel:
         d_temperature = (heater_W - loss_W - reaction_W - sensible_W) \
             / self.calciner.p.thermal_capacity_J_K
 
+        # --- water: electrolysis consumes one mole per mole of H2, the reactor
+        # returns two per mole of CH4 less what the condenser misses
+        water = self.plant["water"]
+        d_water = (u[_IU["water_makeup_kg_s"]]
+                   + 2.0 * water.p.condensate_recovery * r_sab * M_H2O
+                   - r_h2 * M_H2O)
+
         return mx.vertcat(
             d_soc,
             r_carb - r_calc,
@@ -449,16 +550,47 @@ class PlannerModel:
             r_h2 - 4.0 * r_sab - u[_IU["h2_vent_mol_s"]],
             r_calc - r_sab - u[_IU["co2_vent_mol_s"]],
             d_temperature,
+            d_water,
         )
 
-    def step(self, z, u, w: Mapping[str, Any], dt_s: float, substeps: int = 2):
-        """One RK4 step of length `dt_s`, optionally subdivided.
+    #: Longest RK4 sub-step, s. The kiln climbs ~170 K/h at full heater duty
+    #: while its own reaction rate changes sharply with temperature, so a single
+    #: RK4 step over an hour visibly overshoots the calcination threshold. Half
+    #: an hour is short enough; the check is
+    #: `test_rk4_step_agrees_with_a_fine_forward_euler`.
+    MAX_SUBSTEP_S: float = 1800.0
 
-        Two substeps by default. At full heater duty the kiln climbs ~170 K in an
-        hour while its own reaction rate changes sharply with temperature, and a
-        single RK4 step over 3600 s visibly overshoots the calcination threshold.
-        Two halves cost one extra RHS evaluation per stage and remove the error.
+    #: Ceiling on sub-steps per interval, regardless of how long the interval is.
+    MAX_SUBSTEPS: int = 3
+
+    def substeps_for(self, dt_s: float) -> int:
+        """How many RK4 sub-steps an interval of `dt_s` needs.
+
+        Two competing requirements, and the cap is where they are traded.
+
+        Accuracy wants the sub-step short: a six-hour interval integrated in two
+        steps would be badly wrong for a kiln whose reaction rate switches within
+        an hour. But scaling the count with the interval length defeats the
+        graded grid entirely. Seven days at `MAX_SUBSTEP_S` costs 1344 RHS
+        evaluations whether the grid is 168 uniform hours or 56 graded intervals
+        -- *identical* -- because halving the number of intervals doubles the
+        sub-steps in each. The grid would shrink the variable count and leave the
+        expression graph, and therefore the cost per iteration, untouched. Worse,
+        a twelve-sub-step RK4 chain is a far more nonlinear constraint row than a
+        two-sub-step one, so the Hessian gets denser exactly where the saving was
+        supposed to come from.
+
+        The cap resolves it by spending accuracy where accuracy is cheap to lose.
+        The first day is hourly and integrates at full resolution; the six-hourly
+        tail is a *valuation device* for the terminal inventories, not a schedule
+        anyone implements, and it is re-planned long before it arrives. Coarse
+        integration out there costs little and buys the whole point of grading.
         """
+        return max(1, min(self.MAX_SUBSTEPS, int(np.ceil(dt_s / self.MAX_SUBSTEP_S))))
+
+    def step(self, z, u, w: Mapping[str, Any], dt_s: float, substeps: int | None = None):
+        """One RK4 step of length `dt_s`, subdivided to bound the local error."""
+        substeps = self.substeps_for(dt_s) if substeps is None else substeps
         h = dt_s / substeps
         for _ in range(substeps):
             k1 = self.rhs(z, u, w)
@@ -492,11 +624,12 @@ class PlannerModel:
         d_cycles = r_calc / self.n_total_mol * dt_s
         sorbent_cost = d_cycles * self._sorbent_cost_per_cycle_EUR()
 
-        # net make-up: electrolysis consumes 1 mol H2O per mol H2, the reactor
-        # returns 2 per mol CH4 less condenser losses
-        water_kg = (r_h2 - 2.0 * self.gas.p.condensate_recovery * r_sab) * M_H2O * dt_s
-        water_cost = (economics.p.water_cost_per_m3
-                      * mx.smooth_max(water_kg, 0.0, eps=1e-3) / 1000.0)
+        # Water is charged on what is actually delivered. That is both more
+        # honest -- the cost is a road tanker, not a stoichiometric balance --
+        # and strictly better conditioned, because the delivery is a non-negative
+        # control and so *is* the positive part, with no smoothing needed.
+        water_kg = u[_IU["water_makeup_kg_s"]] * dt_s
+        water_cost = economics.p.water_cost_per_m3 * water_kg / 1000.0
 
         return revenue - battery_cost - sorbent_cost - water_cost
 
