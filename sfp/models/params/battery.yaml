@@ -71,6 +71,43 @@ params:
     uncertain: true
     sigma: 0.20
 
+  dod_reference:
+    value: 0.80
+    units: "-"
+    provenance: literature
+    source: "The depth `cycle_life` is rated at -- same datasheet note, 80 % DoD"
+    note: >
+      Cycle life is meaningless without the depth it was measured at. This is
+      that depth, and it is what makes `cost_per_kWh_delivered_EUR` correct: a
+      rated cycle moves 0.8 of nameplate, not all of it.
+
+  dod_exponent:
+    value: 3.0
+    units: "-"
+    provenance: assumed
+    note: >
+      Exponent k in N(DoD) = N_ref (DoD_ref/DoD)^k, the usual way cycle life is
+      extended to depths other than the rated one. k = 3 means going from 80 %
+      to 100 % DoD costs roughly half the cycle life, which is the right order
+      for LFP; k = 1 would make total energy throughput the only thing that
+      matters, which is what the model assumed before and is too generous to
+      deep cycling.
+
+      Sensitive and weakly sourced. Anything between 2 and 4 is defensible, and
+      a sizing conclusion that flips inside that range should be reported as
+      undetermined rather than as a result.
+    uncertain: true
+    sigma: 0.30
+
+  dod_stress_floor:
+    value: 0.25
+    units: "-"
+    provenance: assumed
+    note: >
+      Floor on the depth factor, so very shallow cycling is cheaper than rated
+      but never free. Without it the stress term goes to zero at mid-band and a
+      controller could trickle energy through the pack at no modelled cost.
+
   end_of_life_fade:
     value: 0.20
     units: "-"

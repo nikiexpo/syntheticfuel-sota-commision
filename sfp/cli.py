@@ -147,6 +147,8 @@ def controllers_for(names: list[str]):
         PerfectForesightOracle,
         RuleBasedController,
     )
+    from sfp.control.dispatch import EconomicDispatch
+    from sfp.control.dispatch_nmpc import DispatchNMPCController
     from sfp.control.hierarchical import HierarchicalController
     from sfp.control.planner import EconomicPlanner
 
@@ -156,6 +158,8 @@ def controllers_for(names: list[str]):
         "planner": EconomicPlanner,
         "oracle": PerfectForesightOracle,
         "hierarchical": HierarchicalController,
+        "dispatch": EconomicDispatch,
+        "dispatch-nmpc": DispatchNMPCController,
     }
     out = []
     for name in names:

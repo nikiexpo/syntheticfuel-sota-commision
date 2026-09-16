@@ -101,7 +101,31 @@ class Battery(Subsystem):
         # one equivalent full cycle = a full charge plus a full discharge
         d_efc = (p_charge + p_discharge) / (2.0 * self.nominal_energy_J)
 
-        cycle_fade = self.p.end_of_life_fade / self.p.cycle_life * d_efc
+        # Cycle fade, weighted by how deeply the pack is being worked.
+        #
+        # `cycle_life` is rated at `dod_reference`, and real cells lose life
+        # faster than proportionally when cycled deeper: the usual fit is
+        # `N(DoD) = N_ref (DoD_ref/DoD)^k` with k above one, so the fade per unit
+        # of throughput carries a factor `(DoD/DoD_ref)^(k-1)`.
+        #
+        # Without it, throughput is all that matters and a large pack swinging
+        # gently is charged exactly as much per kWh as a small one cycling to its
+        # limits twice a day. That flatters small packs, and it flatters them
+        # precisely in a sizing sweep, which is where the error does most damage.
+        #
+        # **This is a local proxy for a path-dependent quantity.** Depth of
+        # discharge is properly a property of a *cycle*, recovered by rainflow
+        # counting over a trajectory; a differential model cannot see a cycle. The
+        # instantaneous excursion from mid-band is used instead, which gets the
+        # direction and rough magnitude right and should not be read as more than
+        # that. It is floored so that shallow cycling is cheaper but never free.
+        mid = 0.5 * (self.p.soc_max + self.p.soc_min)
+        depth = 2.0 * mx.fabs(soc - mid) / self.p.dod_reference
+        stress = self._dod_normalisation * mx.power(
+            mx.smooth_max(depth, self.p.dod_stress_floor, eps=1e-2),
+            self.p.dod_exponent - 1.0)
+
+        cycle_fade = self.p.end_of_life_fade / self.p.cycle_life * stress * d_efc
         calendar_fade = self.p.calendar_fade_per_year / SECONDS_PER_YEAR
         d_fade = cycle_fade + calendar_fade
 
@@ -136,19 +160,139 @@ class Battery(Subsystem):
     def capex_EUR(self) -> float:
         return self.p.capex_per_kwh * self.p.capacity_kwh
 
+    @property
+    def _dod_normalisation(self) -> float:
+        """Scale that makes a rated-depth cycle cost exactly one rated cycle.
+
+        The stress term is evaluated at each instant, but `cycle_life` is a
+        rating for a whole *cycle*. A cycle at the reference depth sweeps the
+        normalised depth from 0 up to 1 and back, so the mean of `depth^(k-1)`
+        along it is `1/k` -- not 1. Left unnormalised the model returns 17,450
+        cycles where the datasheet says 6,000, which is nearly threefold in the
+        battery's favour and would have quietly undone the whole point of adding
+        the depth term.
+
+        Closed form, including the floor: for `d` uniform on [0,1],
+
+            E[max(d, f)^(k-1)] = f^k + (1 - f^k)/k
+        """
+        k = float(self.p.dod_exponent)
+        f = float(self.p.dod_stress_floor)
+        return 1.0 / (f ** k + (1.0 - f ** k) / k)
+
+    def cost_per_kWh_delivered_EUR(self) -> float:
+        """Degradation cost per kWh the pack actually delivers to the bus.
+
+            C_deg = CAPEX / (Capacity * DoD * CycleLife * RTE)
+
+        Three things the denominator accounts for that a bare `capex/cycle_life`
+        does not:
+
+        **DoD.** `cycle_life` is a rating *at a stated depth* -- 6000 cycles at
+        80 % for these cells, per the datasheet note in `battery.yaml`. A "cycle"
+        therefore moves 0.8 of nameplate, not all of it.
+
+        **RTE.** Round-trip losses mean the energy that reaches the bus is
+        `eta_charge * eta_discharge` of what went in. At 0.96 each way that is
+        0.9216, so about 8 % of every cycle is heat.
+
+        Together these were understating wear by a factor of
+        `1/(0.8 * 0.9216) = 1.357`. The controller was being told the battery was
+        a third cheaper to cycle than it is, which biases every storage decision
+        and, in the sizing sweep, every conclusion about how big a pack to buy.
+        """
+        p = self.p
+        usable = p.capacity_kwh * p.dod_reference * p.cycle_life
+        return self.capex_EUR() / (usable * self.round_trip_efficiency())
+
     def cost_per_efc_EUR(self) -> float:
         """Replacement cost attributable to one equivalent full cycle.
 
-        The pack is written off over `cycle_life` cycles, so each cycle carries
-        capex / cycle_life. This is the number the controller pays to move energy
-        through the battery, and it is what makes chemical storage look cheap by
-        comparison whenever the chemistry can absorb the energy instead.
+        One EFC is `2 * capacity` of throughput -- charge in plus discharge out --
+        so this is `C_deg` scaled to that. It still rises linearly with pack size,
+        because a bigger pack costs more to replace and moves more energy per
+        cycle; what is *independent* of size is the cost per kWh moved, which is
+        correct: the same chemistry wears at the same rate per unit of energy.
         """
-        return self.capex_EUR() / self.p.cycle_life
+        return self.cost_per_kWh_delivered_EUR() * self.p.capacity_kwh
 
     def cost_per_kWh_throughput_EUR(self) -> float:
         """Marginal degradation cost of battery throughput, EUR/kWh."""
         return self.cost_per_efc_EUR() / (2.0 * self.p.capacity_kwh)
+
+    # --- how long the pack actually lasts --------------------------------
+    def fade_rates_per_year(self, efc_per_year: float,
+                            mean_stress: float = 1.0) -> tuple[float, float]:
+        """`(calendar, cycle)` fade per year at a given duty."""
+        calendar = float(self.p.calendar_fade_per_year)
+        cycle = (float(self.p.end_of_life_fade) / float(self.p.cycle_life)
+                 * float(mean_stress) * float(efc_per_year))
+        return calendar, cycle
+
+    def life_years(self, efc_per_year: float, mean_stress: float = 1.0) -> float:
+        """Years until the pack reaches its end-of-life fade at this duty."""
+        calendar, cycle = self.fade_rates_per_year(efc_per_year, mean_stress)
+        total = calendar + cycle
+        return float(self.p.end_of_life_fade) / total if total > 0 else float("inf")
+
+    def uncharged_replacement_PV_EUR(
+        self, *, project_years: float, discount_rate: float,
+        efc_per_year: float, mean_stress: float = 1.0,
+    ) -> float:
+        """Present value of pack replacements that nothing else pays for.
+
+        The capital annuity amortises the battery over the *project's* life. The
+        pack does not last that long: calendar fade alone (0.015/yr against a
+        0.20 end-of-life threshold) gives 13.3 years, and cycling shortens it
+        further -- at two equivalent full cycles a day a 1500 kWh pack lasts
+        about five years, so the project needs four packs, not one.
+
+        **Only the calendar-attributable share is returned, and that is the whole
+        subtlety.** The operating objective already charges
+        `cost_per_kWh_delivered` on every kWh moved, and over one pack's rated
+        cycle life those charges total exactly one pack. So cycling *is* funded,
+        through operating profit. What is not funded is the part of each
+        replacement caused by time rather than use:
+
+            share_uncharged = calendar / (calendar + cycle)
+
+        Charging the whole replacement here as well would count the cycling twice
+        and make the battery look worse than it is -- the opposite error, and
+        just as wrong.
+        """
+        calendar, cycle = self.fade_rates_per_year(efc_per_year, mean_stress)
+        total = calendar + cycle
+        if total <= 0:
+            return 0.0
+        life = float(self.p.end_of_life_fade) / total
+        share = calendar / total
+        cost = self.capex_EUR() * share
+
+        present = 0.0
+        t = life
+        while t < project_years:
+            present += cost / (1.0 + discount_rate) ** t
+            t += life
+        return present
+
+    def mean_stress_over(self, soc_trajectory, weights=None) -> float:
+        """Duty-weighted mean of the depth-of-discharge stress factor.
+
+        `weights` should be the throughput in each interval, so that stress is
+        averaged over *energy moved* rather than over wall-clock time: an hour
+        sitting idle at a deep state of charge damages nothing.
+        """
+        soc = np.asarray(soc_trajectory, dtype=float)
+        mid = 0.5 * (self.p.soc_max + self.p.soc_min)
+        depth = 2.0 * np.abs(soc - mid) / self.p.dod_reference
+        stress = self._dod_normalisation * np.maximum(
+            depth, self.p.dod_stress_floor) ** (self.p.dod_exponent - 1.0)
+        if weights is None:
+            return float(np.mean(stress))
+        w = np.asarray(weights, dtype=float)
+        n = min(len(w), len(stress))
+        return float(np.average(stress[:n], weights=w[:n])) if w[:n].sum() > 0 \
+            else float(np.mean(stress))
 
     def degradation_cost_EUR(self, efc_used: float) -> float:
         return self.cost_per_efc_EUR() * efc_used

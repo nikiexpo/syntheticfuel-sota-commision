@@ -81,6 +81,10 @@ class NMPCSolution:
     curtail_fraction: float
     objective_EUR: float
     price_EUR_per_kWh: float
+    #: Load shed the inner layer expects over its horizon, kWh. Non-zero means
+    #: the dispatch layer has committed more than the bus can carry, which is
+    #: worth reporting rather than absorbing silently.
+    predicted_shed_kWh: float = 0.0
     stats: Any = None
     states: np.ndarray | None = field(default=None, repr=False)
     controls: np.ndarray | None = field(default=None, repr=False)
@@ -106,6 +110,42 @@ class InnerNMPC:
         tol: float = 1e-4,
         rate_limit: float = 0.34,
         terminal_weight: float = 1.0,
+        #: Price charged for predicting a load shed, EUR/kWh. Against a shadow
+        #: price of order 0.05 this is a hundredfold penalty, so shedding is a
+        #: genuine last resort rather than a cheap way out of a tight hour.
+        #: Used by the economic objective only; the tracking one uses
+        #: `shed_weight`, which carries no units.
+        shed_penalty_EUR_per_kWh: float = 5.0,
+        #: `"economic"` maximises operating profit -- the original formulation,
+        #: kept because `HierarchicalController` is built around it.
+        #:
+        #: `"tracking"` is the proposed architecture: the inner layer makes no
+        #: economic decision at all. Every euro lives in the dispatch LP, and
+        #: this layer only has to realise the strategy it is handed on the real
+        #: sixteen-state dynamics, at five-minute resolution, without violating
+        #: anything. See `_tracking_objective`.
+        objective: str = "economic",
+        #: Tracking mode weights, all dimensionless. Setpoint deviation is
+        #: O(1) because controls are scaled to their own bounds; inventory
+        #: deviation is normalised by the state scale, so a 10 % drift on a
+        #: buffer costs `0.01 * terminal_weight` against a full setpoint
+        #: deviation's `setpoint_weight`. The defaults make a 10 % inventory
+        #: drift equal to one saturated setpoint.
+        setpoint_weight: float = 1.0,
+        #: Tracking mode only, so the economic path that `HierarchicalController`
+        #: uses keeps its own `terminal_weight` untouched. 100 is what the
+        #: comment above actually implies: inventory deviation is normalised
+        #: by the state scale, so a 10 % drift contributes 0.01 and needs a
+        #: weight of 100 to match one saturated setpoint. Left at 1.0 it is a
+        #: hundredfold too weak, and the layer will drain a buffer to its floor
+        #: rather than give up a setpoint -- which is what it did.
+        tracking_terminal_weight: float = 100.0,
+        #: Weight on a soft band excursion. Between tracking and shed by two
+        #: orders each way: a ramp that overshoots the plan's ceiling for an
+        #: interval must dominate ordinary tracking error, and must never
+        #: compete with keeping the bus supplied.
+        band_weight: float = 1.0e2,
+        shed_weight: float = 1.0e4,
     ) -> None:
         self.plant = plant
         self.economics = economics
@@ -114,6 +154,14 @@ class InnerNMPC:
         self.n_steps = max(1, int(round(self.horizon_s / self.dt_s)))
         self.rate_limit = float(rate_limit)
         self.terminal_weight = float(terminal_weight)
+        self.shed_penalty_EUR_per_kWh = float(shed_penalty_EUR_per_kWh)
+        if objective not in ("economic", "tracking"):
+            raise ValueError(f"objective must be 'economic' or 'tracking', got {objective!r}")
+        self.objective = objective
+        self.setpoint_weight = float(setpoint_weight)
+        self.band_weight = float(band_weight)
+        self.tracking_terminal_weight = float(tracking_terminal_weight)
+        self.shed_weight = float(shed_weight)
         self.backend = (
             backend if isinstance(backend, SolverBackend)
             else get_backend(backend, max_iter=max_iter, tol=tol,
@@ -277,6 +325,126 @@ class InnerNMPC:
                 lo[i_s] = hi[i_s] = guess[i_s] = 0.0
         return lo, hi, guess
 
+    def _bind_bands(self, bands: Mapping[str, Any]):
+        """Apply the dispatch layer's bands. Returns `(lo, hi, guess, ceilings)`.
+
+        Commitment is a *bound*, which is the point of banding rather than
+        flagging: handed down as a flag it becomes a variable sitting on a
+        near-discontinuous gate, handed down as a bound it costs no variable and
+        no smoothing. Per subsystem:
+
+            committed      enable pinned to 1, setpoint ceiling enforced softly
+            not committed  enable and setpoint both pinned to 0
+
+        **The ceiling is soft, and that is not a convenience.** A setpoint is
+        slew-limited -- the plant models no actuator dynamics at all, so the
+        NMPC's rate limit is the only thing standing in for a valve that cannot
+        jump. When a band narrows faster than the actuator can follow, a hard
+        ceiling and the rate limit have no feasible point between them: measured,
+        115 of 216 solves returned `Infeasible_Problem_Detected`.
+
+        The physically correct response to a ceiling dropping from 0.9 to 0.2 is
+        a ramp -- 0.56, 0.22, 0.20 -- which necessarily spends two intervals
+        above the band. A soft ceiling admits exactly that trajectory and prices
+        the excursion, so the solver converges to the band as fast as the slew
+        allows and no faster.
+
+        The lower edge stays hard, because it is realised by the enable pin: a
+        committed machine draws its idle load as a consequence of being
+        energised, which is discrete and not slew-limited.
+
+        `ceilings` is NaN wherever no ceiling applies.
+        """
+        lo = np.array(self._u_lo, dtype=float, copy=True)
+        hi = np.array(self._u_hi, dtype=float, copy=True)
+        guess = self._guess_u()
+        ceilings = np.full(self._n_u, np.nan)
+
+        for key in self._input_keys:
+            if key in ("pv", "battery") or self._input_sizes[key] < 2:
+                continue
+            band = bands.get(key)
+            if band is None:
+                continue
+            i_e = self._u_index(key, ENABLE_INDEX)
+            i_s = self._u_index(key, SETPOINT_INDEX)
+            if not band.committed:
+                lo[i_e] = hi[i_e] = guess[i_e] = 0.0
+                lo[i_s] = hi[i_s] = guess[i_s] = 0.0
+                continue
+            lo[i_e] = hi[i_e] = guess[i_e] = 1.0
+            # The ceiling is NOT written into `hi` -- it is enforced softly, as a
+            # penalised row, because a hard box on a slew-limited control is
+            # infeasible the moment the band narrows faster than the actuator can
+            # follow. `ceilings` carries it to the constraint builder.
+            ceilings[i_s] = float(np.clip(band.setpoint_max, 0.0, hi[i_s]))
+            guess[i_s] = float(np.clip(guess[i_s], lo[i_s], ceilings[i_s]))
+        return lo, hi, guess, ceilings
+
+    def _tracking_target(self, bands) -> tuple[list[int], np.ndarray]:
+        """Which control columns to follow, and the value to follow, scaled.
+
+        Only the four process setpoints. The battery and the curtailment
+        fraction are deliberately *not* tracked: they are the balancing degrees
+        of freedom that close the bus in real time against weather the dispatch
+        layer forecast an hour ago, and pinning them to a plan would remove the
+        one thing the inner layer is there to do. Enables are already pinned by
+        the band, so tracking them would be redundant.
+
+        A decommitted machine has its setpoint pinned to zero by the band, so it
+        contributes nothing either way.
+        """
+        cols: list[int] = []
+        values: list[float] = []
+        if not bands:
+            return cols, np.zeros(0)
+        for key in self._input_keys:
+            if key in ("pv", "battery") or self._input_sizes[key] < 2:
+                continue
+            band = bands.get(key)
+            if band is None or not band.committed:
+                continue
+            i_s = self._u_index(key, SETPOINT_INDEX)
+            cols.append(i_s)
+            values.append(float(band.setpoint) / float(self._u_scale[i_s]))
+        return cols, np.array(values, dtype=float)
+
+    @staticmethod
+    def _setpoint_deviation(u_block, track):
+        """Sum of squared deviations from the plan, in scaled control units."""
+        cols, values = track
+        if not cols:
+            return 0.0
+        d = u_block[cols] - ca.DM(values)
+        return ca.dot(d, d)
+
+    def _rate_limited(self, u_lo: np.ndarray, u_hi: np.ndarray) -> list[int]:
+        """Which control columns the rate limit may be applied to.
+
+        Two exclusions, and the second one was a real defect.
+
+        **Enables are never rate-limited.** Commitment is a discrete event -- a
+        machine is either energised or it is not -- so bounding how fast an
+        enable may change is meaningless in the first place.
+
+        **A pinned control cannot move, so constraining its rate cannot help and
+        can only hurt.** Once the dispatch layer pins an enable, the rate row
+        against `last_u` demands |0 - 1| = 1.0 against a limit of 0.34. The
+        feasible set is then *empty*, and IPOPT says so in seven iterations.
+
+        That is what made 846 of 864 solves fail in the first banded run, and it
+        failed in the worst possible way: every failure fell back silently to the
+        dispatch layer's own request, so the run completed, reported no error,
+        and produced results bit-identical to the layer below it. An inner layer
+        that is doing nothing at all looks exactly like an inner layer that is
+        adding nothing -- `nmpc_failed` was the only thing separating them.
+        """
+        movable = (u_hi - u_lo) > 1e-9
+        for key in self._input_keys:
+            if key not in ("pv", "battery") and self._input_sizes[key] >= 2:
+                movable[self._u_index(key, ENABLE_INDEX)] = False
+        return [int(i) for i in np.flatnonzero(movable)]
+
     def _u_index(self, key: str, within: int) -> int:
         offset = 0
         for k in self._input_keys:
@@ -297,6 +465,7 @@ class InnerNMPC:
         terminal_prices: Mapping[str, float] | None = None,
         last_u: np.ndarray | None = None,
         enables: Mapping[str, float] | None = None,
+        bands: Mapping[str, Any] | None = None,
     ) -> NMPCSolution:
         """Solve the local problem over `n_steps` intervals from `t`.
 
@@ -304,15 +473,20 @@ class InnerNMPC:
         interval. `targets` and `terminal_prices` are keyed by full state name
         (``"gas.n_h2"``) and value the terminal state -- they are what carries
         the planner's long view into a one-hour problem.
+
+        `bands` is the newer interface: one `Band` per subsystem, carrying a
+        commitment and a setpoint ceiling. It supersedes `enables`, which passed
+        only the commitment. When both are given the band wins.
         """
-        if not targets or not terminal_prices:
+        if not targets or (self.objective == "economic" and not terminal_prices):
             raise ValueError(
-                "InnerNMPC needs terminal inventory prices. Since lambda prices "
-                "only the battery, nothing in a one-hour horizon rewards making "
-                "hydrogen or carbonate -- the methane they become is hours away "
-                "-- so without a terminal value the process setpoints sit on a "
-                "flat manifold, the solve does not converge, and any answer it "
-                "does return is arbitrary. The planner supplies these."
+                "InnerNMPC needs terminal inventory targets (and, in economic "
+                "mode, their prices). Nothing in a one-hour horizon rewards "
+                "making hydrogen or carbonate -- the methane they become is "
+                "hours away -- so without a terminal term the process setpoints "
+                "sit on a flat manifold, the solve does not converge, and any "
+                "answer it does return is arbitrary. The layer above supplies "
+                "these."
             )
 
         n = self.n_steps
@@ -327,12 +501,6 @@ class InnerNMPC:
         lo = np.minimum(self._x_lo, x0)
         hi = np.maximum(self._x_hi, x0)
 
-        b = NLPBuilder("nmpc")
-        xv = b.variable(
-            "x", (n + 1) * self.n_x,
-            lb=np.tile(lo / xs, n + 1), ub=np.tile(hi / xs, n + 1),
-            x0=np.tile(x0 / xs, n + 1),
-        )
         # Commitment is fixed, not optimised. The plant gates every subsystem
         # with `smooth_step(e - 0.5, width=0.05)`, which is a near-discontinuity:
         # as a free variable the enable has essentially zero gradient anywhere
@@ -343,7 +511,46 @@ class InnerNMPC:
         # modulation at the price it is given. Pinning the enables here removes
         # four near-discontinuous gates per interval *and* puts the decision in
         # the layer that has the horizon to make it.
-        u_lo, u_hi, u_guess = self._bind_enables(enables)
+        if bands:
+            u_lo, u_hi, u_guess, ceilings = self._bind_bands(bands)
+        else:
+            u_lo, u_hi, u_guess = self._bind_enables(enables)
+            ceilings = np.full(self._n_u, np.nan)
+        capped = [int(i) for i in np.flatnonzero(np.isfinite(ceilings))]
+        movable = self._rate_limited(u_lo, u_hi)
+        track = self._tracking_target(bands)
+
+        b = NLPBuilder("nmpc")
+        xv = b.variable(
+            "x", (n + 1) * self.n_x,
+            lb=np.tile(lo / xs, n + 1), ub=np.tile(hi / xs, n + 1),
+            x0=np.tile(x0 / xs, n + 1),
+        )
+        # Predicted load shed, per interval, in units of the power scale.
+        shed = b.variable("shed", n, lb=0.0, ub=10.0, x0=0.0)
+        # Excursion above each soft band ceiling, per capped control per interval.
+        over = (b.variable("band_over", n * len(capped), lb=0.0, ub=1.0, x0=0.0)
+                if capped else None)
+
+        # The rate-limit reference is where the actuator *actually is*, and it is
+        # deliberately not projected into the current band.
+        #
+        # When a band narrows -- a ceiling dropping from 0.9 to 0.2 -- the old
+        # control sits outside the new box, and a hard ceiling plus
+        # `|u_0 - last_u| <= 0.34` has no feasible point: 115 of 216 solves
+        # returned Infeasible_Problem_Detected this way.
+        #
+        # Projecting the reference to 0.2 removes the infeasibility by deleting
+        # the constraint that caused it, and is wrong. The plant models no
+        # actuator slew at all, so this rate limit *is* the only representation
+        # of a valve that cannot jump; pretending the actuator was already at the
+        # new ceiling licenses exactly the single-step jump the limit exists to
+        # forbid. The physically correct trajectory is a ramp -- 0.56, 0.22, 0.20
+        # -- which spends two intervals outside the band.
+        #
+        # So the band ceiling is soft instead (see `slack` below). The reference
+        # stays where the actuator is.
+        reference = None if last_u is None else np.asarray(last_u, dtype=float)
         uv = b.variable(
             "u", n * self._n_u,
             lb=np.tile(u_lo / us, n), ub=np.tile(u_hi / us, n),
@@ -365,8 +572,25 @@ class InnerNMPC:
             # the plant's own coupled dynamics, with no clipping
             defects.append((X[k + 1] - step["x_next"]) / Sx)
 
-            # --- bus balance: the plant's sign convention makes this a plain sum
-            balances.append(step["bus_total"] / self._p_scale)
+            # --- bus balance, with the shed the real bus can perform.
+            #
+            # `bus_total` is the sum of every power channel, so a positive value
+            # is a deficit -- and a deficit is something the DC bus resolves by
+            # shedding load. Modelling the balance as a hard equality therefore
+            # made the NMPC *more rigid than the plant it controls*: wherever the
+            # plant would simply shed, the NMPC had no feasible point at all.
+            #
+            # With commitment pinned by the dispatch layer the idle loads are
+            # mandatory, so this bites exactly where it hurts -- a nearly flat
+            # battery at night against a hard SoC floor. Measured: 35 % of solves
+            # infeasible even after the rate-limit fix.
+            #
+            # The slack is non-negative (you cannot shed a surplus; curtailment
+            # handles that) and priced far above any real energy value, so the
+            # solver will exhaust every alternative first. Its real worth is as a
+            # diagnostic: a positive shed is the inner layer predicting that the
+            # dispatch layer has committed more load than the bus can carry.
+            balances.append(step["bus_total"] / self._p_scale - shed[k])
 
             # --- the local economic objective
             r_sab = step["r_ch4"]
@@ -400,17 +624,35 @@ class InnerNMPC:
             # at noon -- exactly when the battery should be filling for the
             # evening. Storage is worth the price at the hour it will be *used*,
             # which a one-hour horizon cannot see and the terminal value can.
-            profit = profit + dt * (
-                self.economics.p.methane_price_per_kg * r_sab * M_CH4
-            ) - efc * self._battery.cost_per_efc_EUR()
+            if self.objective == "tracking":
+                # No euros. The dispatch LP already decided what to run and how
+                # hard; this layer's only job is to realise that on dynamics the
+                # LP could not see, and to say so when it cannot.
+                profit = profit - self.setpoint_weight * self._setpoint_deviation(
+                    uv[k * self._n_u:(k + 1) * self._n_u], track)
+            else:
+                profit = profit + dt * (
+                    self.economics.p.methane_price_per_kg * r_sab * M_CH4
+                ) - efc * self._battery.cost_per_efc_EUR()
 
             # --- rate limits. Real actuators move at a finite speed, and an
             # unconstrained NMPC will happily chatter a kiln between 0 and 1 on
             # a five-minute grid because the model lets it.
-            prev = ca.DM(np.asarray(last_u, dtype=float)) if k == 0 and last_u is not None \
+            prev = ca.DM(reference) if k == 0 and reference is not None \
                 else (U[k - 1] if k > 0 else None)
-            if prev is not None:
-                rates.append((U[k] - prev) / Su)
+            if prev is not None and len(movable):
+                rates.append((U[k][movable] - prev[movable]) / Su[movable])
+
+        # --- soft band ceilings: u <= ceiling + over, over >= 0
+        if capped:
+            rows = []
+            for k in range(n):
+                blk = uv[k * self._n_u:(k + 1) * self._n_u]
+                for m, col in enumerate(capped):
+                    rows.append(blk[col]
+                                - float(ceilings[col] / self._u_scale[col])
+                                - over[k * len(capped) + m])
+            b.constraint("band_ceiling", ca.vertcat(*rows), lb=-1e3, ub=0.0)
 
         b.constraint("dynamics", ca.vertcat(*defects), equals=0.0)
         b.constraint(BUS_BALANCE, ca.vertcat(*balances), equals=0.0)
@@ -418,12 +660,40 @@ class InnerNMPC:
             b.constraint("rate_limit", ca.vertcat(*rates),
                          lb=-self.rate_limit, ub=self.rate_limit)
 
+        # Band excursions are penalised well above setpoint tracking but well
+        # below a shed: exceeding the plan's ceiling for an interval while the
+        # actuator ramps is undesirable, and is not in the same class as failing
+        # to supply the bus.
+        if capped:
+            profit = profit - self.band_weight * ca.sum1(over)
+
+        shed_kWh = self._p_scale * dt / 3.6e6
+        if self.objective == "tracking":
+            # Dimensionless, and far above anything tracking or the terminal term
+            # can offer, so a shed is never traded for a better-followed plan.
+            profit = profit - self.shed_weight * ca.sum1(shed)
+        else:
+            # Priced per kWh actually shed, so the penalty scales with the
+            # interval length rather than being an arbitrary per-row constant.
+            profit = profit - self.shed_penalty_EUR_per_kWh * shed_kWh * ca.sum1(shed)
+
         b.maximise(profit + self._terminal_value(X[n], names, targets,
                                                  terminal_prices))
         nlp = b.build()
 
-        warm = self._warm if (self._warm is not None
-                              and self._warm.size == nlp.n_x) else None
+        # Project the stored trajectory into the *current* box before reusing it.
+        #
+        # The variable count does not change when a band moves, so the stored
+        # solution always looks reusable -- but a band that has narrowed leaves
+        # it sitting outside the new bounds, and IPOPT then spends its early
+        # iterations pushing an infeasible point back onto the feasible set
+        # rather than optimising. Band changes are rare while the plant is idle
+        # and constant once it is cycling, which is exactly the pattern seen in
+        # the solve times: under a second early in a run, several seconds once
+        # every machine is committed.
+        warm = None
+        if self._warm is not None and self._warm.size == nlp.n_x:
+            warm = np.clip(self._warm, nlp.lbx, nlp.ubx)
         started = time.perf_counter()
         solution = self.backend.solve(nlp, x0=warm)
         elapsed = time.perf_counter() - started
@@ -459,6 +729,7 @@ class InnerNMPC:
             curtail_fraction=float(np.clip(u_first[self._u_index("pv", 0)], 0.0, 1.0)),
             objective_EUR=-solution.f,
             price_EUR_per_kWh=float(prices[0]),
+            predicted_shed_kWh=float(np.sum(solution.value("shed")) * shed_kWh),
             stats=solution.stats,
             states=states,
             controls=solution.value("u").reshape(n, self._n_u) * us,
@@ -494,18 +765,31 @@ class InnerNMPC:
         respects the fact that the planner chose that target for a reason. The
         inner layer stays free to deviate where local conditions justify it,
         which is the whole point of not tracking a setpoint trajectory.
+
+        In **tracking** mode there are no prices at all. The deviation is
+        normalised by the state's own characteristic magnitude and weighted by a
+        dimensionless `terminal_weight`, so ending the horizon 10 % away from the
+        planned inventory costs `0.01 * terminal_weight` against a fully
+        saturated setpoint's `setpoint_weight`. What a banked mole is *worth*
+        was settled by the dispatch LP; this layer only needs to know where the
+        plan expects the buffers to be.
         """
-        if not targets or not terminal_prices:
+        if not targets:
+            return 0.0
+        tracking = self.objective == "tracking"
+        if not tracking and not terminal_prices:
             return 0.0
         penalty = 0.0
         index = {name: i for i, name in enumerate(names)}
         for name, target in targets.items():
-            if name not in index or name not in terminal_prices:
+            if name not in index:
+                continue
+            if not tracking and name not in terminal_prices:
                 continue
             i = index[name]
             scale = max(float(self._x_scale[i]), 1e-9)
-            deviation = x_end[i] - float(target)
-            penalty = penalty + (self.terminal_weight
-                                 * float(terminal_prices[name])
-                                 * deviation * deviation / scale)
+            deviation = (x_end[i] - float(target)) / scale
+            weight = self.tracking_terminal_weight if tracking else (
+                self.terminal_weight * float(terminal_prices[name]) * scale)
+            penalty = penalty + weight * deviation * deviation
         return -penalty

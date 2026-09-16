@@ -239,13 +239,19 @@ class EconomicPlanner(Controller):
         setpoints, enables = {}, {}
         for key in COMMITTED:
             e = float(u[ui(f"{key}_on")])
-            committed = e >= self.commit_threshold
+            raw = float(np.clip(u[ui(_SETPOINT_OF[key])], 0.0, 1.0))
+            # Commit whenever the plan intends output, not only when the relaxed
+            # enable clears 0.5. Rounding an enable of 0.45 down to off discards
+            # the setpoint of 0.42 underneath it -- measured on the contactor,
+            # twelve intervals planned at 38-42 % flow and every one shut off by
+            # the rounding. Rounding up costs the idle draw and keeps the
+            # production, which is much the better error.
+            committed = e >= self.commit_threshold or raw > 1e-4
             enables[key] = 1.0 if committed else 0.0
             # The setpoint is the rate; the enable only priced the parasitic
             # load (see PlannerModel.rates). So rounding the commitment up needs
             # no renormalisation -- the setpoint already means what it says.
-            raw = float(u[ui(_SETPOINT_OF[key])])
-            setpoints[key] = float(np.clip(raw, 0.0, 1.0)) if committed else 0.0
+            setpoints[key] = raw if committed else 0.0
 
         return Request(
             setpoints=setpoints,

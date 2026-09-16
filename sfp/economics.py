@@ -164,6 +164,61 @@ class Economics:
             return float("inf")
         return capex.total / annual_margin
 
+    def discounted_payback_years(
+        self,
+        capex_EUR: float,
+        annual_cash_EUR: float,
+        *,
+        replacement_EUR: float = 0.0,
+        replacement_interval_years: float = float("inf"),
+        horizon_years: float | None = None,
+        steps_per_year: int = 12,
+    ) -> float:
+        """Years until discounted cash flow first repays the investment.
+
+        Preferred over a break-even *price* wherever price is a swept axis: the
+        break-even price solves for the very quantity the sweep is varying, and
+        collapses it. Payback is defined at every point of the sweep and answers
+        "how long", not just "does it".
+
+        It is also more honest than an annuitised profit rate. Net EUR/day at a
+        capital recovery factor already assumes the project's full life at the
+        discount rate, so a positive figure means only "repays within 25 years at
+        7 %" -- a binary, dressed as a continuous number.
+
+        **`annual_cash_EUR` must exclude any accrued wear charge.** Operating
+        profit as the controller computes it subtracts `cost_per_kWh_delivered`
+        on every kWh moved, which is an accrual for a replacement that has not
+        happened yet. A cash-flow model pays for replacements when they occur,
+        as `replacement_EUR` lumps -- so the accrual has to be added back first
+        or the battery is charged twice.
+
+        Returns `inf` if the investment is not repaid within `horizon_years`
+        (the project lifetime by default), which includes every case where the
+        cash flow is negative.
+        """
+        horizon = float(self.p.project_lifetime_years) if horizon_years is None \
+            else float(horizon_years)
+        if annual_cash_EUR <= 0.0:
+            return float("inf")
+
+        r = float(self.p.discount_rate)
+        dt = 1.0 / steps_per_year
+        cumulative = -float(capex_EUR)
+        next_replacement = replacement_interval_years
+
+        t = 0.0
+        while t < horizon:
+            t += dt
+            discount = (1.0 + r) ** -t
+            cumulative += annual_cash_EUR * dt * discount
+            if replacement_EUR > 0.0 and t >= next_replacement:
+                cumulative -= replacement_EUR * discount
+                next_replacement += replacement_interval_years
+            if cumulative >= 0.0:
+                return t
+        return float("inf")
+
     # --- helpers ----------------------------------------------------------
     @staticmethod
     def stoichiometric_water_kg(ch4_kg: float) -> float:

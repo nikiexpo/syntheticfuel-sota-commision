@@ -342,10 +342,20 @@ class PlannerModel:
         A subsystem's rate is set by its setpoint alone. The enable appears only
         in `powers`, where it scales the parasitic load, and in the constraint
         `setpoint <= enable`. That combination is the standard relaxation of an
-        on/off decision: the optimiser always drives the enable down to the
-        setpoint (a smaller enable means less parasitic draw, and nothing else
-        depends on it), so at the solution `e = s` and the parasitic load is a
-        linear interpolation of the on/off cost.
+        on/off decision: the optimiser *usually* drives the enable down to the
+        setpoint, since a smaller enable means less parasitic draw and little
+        else depends on it, so at most intervals `e = s` and the parasitic load
+        is a linear interpolation of the on/off cost.
+
+        **Usually, not always.** The start-up epigraph `s_k >= e_k - e_{k-1}`
+        gives the enable a second job, and the optimiser will hold a partial
+        commitment through an idle interval when that is cheaper than paying a
+        full start at the next one. Measured: the reactor sitting at `e = 0.465`
+        with `s = 0`, drawing 3.7 kW for nothing at about EUR 0.19/h to avoid a
+        EUR 2.00 start-up. That is the relaxation working, not failing -- but it
+        means `e = s` is not an invariant and nothing should be built on it. What
+        the rounding relies on is weaker and does hold:
+        `test_commitment_rounding_is_harmless`.
 
         Multiplying the *rate* by the enable as well -- the obvious first move --
         is wrong, and quietly so. With `s <= e` and rate proportional to `s * e`,

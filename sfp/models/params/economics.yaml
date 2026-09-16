@@ -59,13 +59,43 @@ params:
       after condensate recycle.
 
   methane_price_per_kg:
-    value: 1.80
+    value: 3.00
     units: EUR/kg
     provenance: assumed
     note: >
-      Value of the product. Roughly EUR 130/MWh on an LHV basis -- a green-gas
-      price with certificates, not a wholesale natural-gas price. Used as the
-      revenue term in the controller's objective.
+      The value the *controller* places on a kilogram of methane. This is not a
+      market price and is deliberately above one: a green-gas price with
+      certificates is around EUR 1.80/kg (EUR 130/MWh on an LHV basis), and that
+      is what a plant would actually sell for.
+
+      The controller is judged on LCOM, which at the reference sizing is about
+      EUR 6/kg and is almost entirely sunk capital. Writing LCOM as L = C/Q with
+      C = F + vQ, a control change adding dQ at extra cost dC moves it by
+      dL = (dC - L dQ)/Q -- so it is worth spending up to L euros for another
+      kilogram. Priced at 1.80 the controller trades every marginal cost against
+      a number roughly a third of the one it is scored on, and it is
+      systematically biased against producing.
+
+      The effect is not subtle. Measured on `dispatch`, 3 days at Seville:
+
+        price     methane     night   curtail    EFC   trips   LCOM
+        1.80     84.4/day    13.6%     33.5%   0.54     522   8.88
+        3.00    132.7/day    31.9%     21.0%   2.06       0   5.89
+        6.16    132.3/day    32.0%     21.5%   2.02       0   5.90
+
+      At 1.80 a battery round trip costs EUR 0.042/kWh against a night-time
+      shadow price of EUR 0.043 -- break-even -- so the optimiser declines to
+      cycle, curtails a third of the array, runs the battery flat overnight and
+      trips the bus. Above about EUR 3 that flips and the behaviour saturates,
+      so the exact figure does not matter much; 3.00 is chosen as the low end of
+      the range that works rather than as the LCOM itself, which would be
+      circular.
+
+      Caveat: `revenue_EUR`, `marginal_objective_EUR` and `payback_years` all
+      read this parameter, so they now report against a control price rather
+      than a market price and overstate commercial return. LCOM does not -- it
+      is capital over production and is independent of price -- so every
+      controller comparison remains like-for-like.
     uncertain: true
     sigma: 0.25
 

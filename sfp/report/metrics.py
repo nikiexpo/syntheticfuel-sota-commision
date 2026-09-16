@@ -255,7 +255,33 @@ def compute_metrics(
     annual_ch4 = ch4_kg * scale
     water_consumed = final("water_consumed_kg")
     battery_efc = final("battery_efc")
-    annual_battery_cost = plant["battery"].cost_per_efc_EUR() * battery_efc * scale
+    # Battery replacement, in two disjoint parts.
+    #
+    # The cycle-attributable part is what the controller already pays through
+    # `cost_per_kWh_delivered` on every kWh moved; over a pack's rated cycle life
+    # those charges total exactly one pack.
+    #
+    # The calendar-attributable part is paid by nobody. The capital annuity
+    # amortises the battery over the project's 25 years and the pack does not
+    # last them -- 13.3 years on calendar fade alone, and about five at two
+    # equivalent full cycles a day. Counting only the first part understated the
+    # cost of storage; counting the whole replacement in both places would
+    # double-charge the cycling.
+    battery = plant["battery"]
+    annual_battery_cost = battery.cost_per_efc_EUR() * battery_efc * scale
+    efc_per_year = battery_efc * scale
+    throughput = (log.get("battery_charge_W", pd.Series([0.0]))
+                  + log.get("battery_discharge_W", pd.Series([0.0]))).to_numpy()
+    stress = battery.mean_stress_over(
+        log["battery_soc"].to_numpy() if "battery_soc" in log else [0.5],
+        throughput)
+    annual_battery_cost += economics.capital_recovery_factor() * (
+        battery.uncharged_replacement_PV_EUR(
+            project_years=float(economics.p.project_lifetime_years),
+            discount_rate=float(economics.p.discount_rate),
+            efc_per_year=efc_per_year, mean_stress=stress,
+        )
+    )
 
     lcom = economics.lcom(capex, annual_ch4, water_consumed * scale, annual_battery_cost)
     margin = economics.marginal_objective_EUR(

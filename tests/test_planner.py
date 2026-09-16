@@ -301,25 +301,67 @@ def test_lambda_is_lower_when_the_sun_is_up(solved):
         assert lam[:n][sunny].mean() < lam[:n][dark].mean()
 
 
-def test_commitment_relaxation_settles_on_the_setpoint(solved):
-    """`e = s` at the optimum, which is what makes the rounding harmless."""
+def test_commitment_rounding_is_harmless(solved):
+    """Rounding `e` at 0.5 must not change what the plant is asked to do.
+
+    This used to assert the stronger property that `e = s` everywhere at the
+    optimum, on the reasoning that a smaller enable means less parasitic draw and
+    nothing else depends on it. That reasoning is incomplete, and the solver
+    found the gap: with a start-up cost in epigraph form (`s_k >= e_k - e_{k-1}`)
+    it can be worth *holding* a partial commitment through an idle interval to
+    avoid paying a full start at the next one. Measured, the reactor sat at
+    `e = 0.465` with `s = 0`, drawing 3.7 kW of parasitic load at about
+    EUR 0.19/h to avoid a EUR 2.00 start-up. That is the optimiser being right,
+    not wrong.
+
+    What has to hold is the property the rounding actually relies on: wherever a
+    machine is committed after rounding, its setpoint is the one planned; and
+    wherever it is not, the setpoint is zero so nothing is lost by shutting it.
+    """
     planner, _ = solved
-    u = planner.plan.controls
+    plan = planner.plan
+    u = plan.controls
     for key, setpoint in (("contactor", "contactor_flow"),
                           ("electrolyser", "electrolyser_load"),
                           ("sabatier", "sabatier_feed")):
         s = u[:, ui(setpoint)]
         e = u[:, ui(f"{key}_on")]
         assert np.all(e >= s - 1e-5), f"{key}: setpoint exceeded its enable"
-        assert np.max(e - s) < 0.05, f"{key}: enable did not settle onto the setpoint"
+
+    # The rounding itself lives in the emitted Request, so that is what has to
+    # be checked -- reading the raw plan would test the relaxation rather than
+    # the decision taken from it.
+    for k in range(len(plan.controls)):
+        t = plan.t0_s + plan.edges_s[k] + 1.0
+        request = planner._request_from(plan, t, {})
+        for key, setpoint in (("contactor", "contactor_flow"),
+                              ("electrolyser", "electrolyser_load"),
+                              ("sabatier", "sabatier_feed")):
+            planned = float(plan.controls[k][ui(setpoint)])
+            if planned <= 1e-4:
+                continue
+            assert request.enable(key) == 1.0, (
+                f"{key}: interval {k} is planned at setpoint {planned:.3f} but "
+                "rounds to off, so the rounding silently drops planned production"
+            )
+            assert request.setpoint(key) == pytest.approx(planned, abs=1e-6), (
+                f"{key}: interval {k} reaches the plant at a different setpoint "
+                "from the one planned"
+            )
 
 
 def test_plan_respects_the_state_bounds(solved):
     planner, _ = solved
     limits = planner.model.limits()
     lo, hi = limits.lower(), limits.upper()
-    assert np.all(planner.plan.states >= lo - 1e-6)
-    assert np.all(planner.plan.states <= hi + 1e-6)
+    # Relative tolerance, because these bounds span 0.1 (state of charge) to
+    # 3e4 (moles of hydrogen) and a single absolute threshold cannot be right
+    # for both. At 1e-6 absolute this failed on a 4.5e-5 mol excursion below a
+    # 120 mol floor on a 6000 mol tank -- seven parts in a billion of capacity,
+    # which is solver tolerance and not a bound violation.
+    scale = np.maximum(np.abs(hi), 1.0)
+    assert np.all(planner.plan.states >= lo - 1e-6 * scale)
+    assert np.all(planner.plan.states <= hi + 1e-6 * scale)
 
 
 def test_electrolyser_never_runs_below_its_crossover_limit(solved):
