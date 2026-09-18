@@ -1,52 +1,36 @@
-"""Economic dispatch LP over the inner NMPC -- the proposed hierarchy, stage 1.
+"""The shipped controller: economic dispatch MILP over an NMPC safety filter.
 
-Same two-layer shape as `HierarchicalController`, with the outer NLP planner
-replaced by the linear dispatch layer and the commitment flag replaced by a
-dispatch band:
-
-    [L2] economic dispatch LP   240 h hourly, re-solved every 3 h
-              |                 ALL the economics live here
-              |  bands          what each machine may do, as a bound
-              |  x^target       where the buffers should be at the hour
+    [L2] economic dispatch MILP   240 h hourly, re-solved every 3 h
+              |                   ALL the economics live here
+              |  bands            what each machine may do, as a bound
+              |  u_plan           the action it proposes
               v
-    [L3] inner NMPC             1 hour at 10 min, full 16-state model
-              |                 NO economics: follow the strategy, stay feasible
-              |  setpoints
+    [L3] inner NMPC               5 min at 1 min, full 16-state model
+              |                   NO economics: edit u_plan just enough that the
+              |  setpoints        real dynamics are satisfied
               v
     [L4] DC bus + interlocks
 
-The separation
---------------
 **The outer layer makes every economic decision and no dynamic one; the inner
 layer makes every dynamic decision and no economic one.** Not one euro appears
-below L2. The inner objective is
+below L2. The inner objective is ||u_0 - u_plan||^2 plus exact-penalty slacks,
+subject to the real sixteen-state dynamics, the state boxes, rate limits and the
+dispatch bands. Full formulation in `docs/DISPATCH_NMPC.md`.
 
-    minimise   setpoint deviation from the plan        (follow the strategy)
-             + terminal inventory deviation            (end where the plan says)
-             + a large penalty on predicted load shed  (stay feasible)
-
-all dimensionless, subject to the real sixteen-state dynamics, the state boxes,
-rate limits, and the dispatch bands. What a banked mole is *worth* was settled
-upstream; this layer only needs to know where the plan wants it.
-
-What that buys, given the LP already produced a feasible schedule: sub-hourly
+Given that the LP already produced a feasible schedule, that buys sub-minute
 resolution inside an hourly plan, feasibility against dynamics the LP linearised
-away (the kiln's real kinetics, the reactor's light-off, the buffer tapers), and
-a *shed prediction* -- the inner layer saying, before the fact, that the plan
-commits more load than the bus can carry.
+away (the kiln's kinetics, the reactor's light-off, the buffer tapers), and a
+*shed prediction* -- the inner layer saying, before the fact, that the plan has
+committed more load than the bus can carry.
 
-Two things the battery and the curtailment fraction are deliberately *not*:
-tracked, or banded. They are the balancing degrees of freedom that close the bus
-in real time against weather forecast an hour earlier. Pinning them to a plan
-would remove the one thing this layer exists to do.
+The battery and the curtailment fraction are deliberately neither banded nor
+referenced away from the plan's own values: they are the degrees of freedom that
+close the bus in real time against weather forecast an hour earlier.
 
-Why commitment is a bound, not a flag
--------------------------------------
-`HierarchicalController` computes a commitment schedule and never passes it --
-`nmpc.solve` is called without `enables`, so `_bind_enables` short-circuits and
-every enable stays at its initial guess of 1.0. The measured consequence is
-26.4 kW of idle load drawn around the clock by four machines the plan had shut
-down: 317 kWh over a twelve-hour night, or 21 % of the battery.
+Commitment is handed down as a **bound, not a flag**. As a flag it is a free
+variable on a near-discontinuous gate, and an enable left at its initial guess
+draws idle load around the clock -- measured, 26.4 kW from four machines the
+plan had shut down, 317 kWh over a twelve-hour night.
 """
 
 from __future__ import annotations
@@ -84,39 +68,27 @@ class DispatchNMPCController(Controller):
         self,
         *,
         dispatch: EconomicDispatch | None = None,
-        #: Five minutes. The hour this replaces was justified by the terminal
-        #: inventory target sitting at the horizon end -- which filter mode does
-        #: not have, so the horizon is now purely a feasibility certificate and
-        #: does not need to be long. Measured against 1 h / 600 s on identical
-        #: busy states: half the iterations (24.8 vs 51.4), 2.4x faster, a
-        #: smaller problem (360 vs 423 columns), and the same action to within
-        #: 1 % on the edit term.
+        #: Five minutes. In filter mode the horizon is purely a feasibility
+        #: certificate, so it does not need to be long. Measured against 1 h on
+        #: identical busy states: half the iterations (24.8 vs 51.4), 2.4x
+        #: faster, 360 columns against 423, same action to within 1 %.
         nmpc_horizon_s: float = 300.0,
-        #: One minute, matching the simulator's own integration step, so the
-        #: dynamics constraint and the plant agree by construction rather than
-        #: by approximation.
+        #: One minute, matching the simulator's integration step, so the
+        #: dynamics constraint and the plant agree by construction.
         nmpc_dt_s: float = 60.0,
-        #: Pinned at 600 s rather than defaulting to `nmpc_dt_s`. Two reasons,
-        #: and the second is a caveat worth knowing.
+        #: Pinned at 600 s rather than following `nmpc_dt_s`, which would solve
+        #: on every control step instead of every other one.
         #:
-        #: It keeps the solve cadence unchanged from the 600 s configuration, so
-        #: the measured 2.4x is a real saving rather than an accounting one --
-        #: letting this follow `nmpc_dt_s` to 60 s would solve on every control
-        #: step instead of every other one.
-        #:
-        #: **The k = 0 rate-limit row then spans 600 s while the k > 0 rows span
-        #: 60 s**, and `rate_limit` is a single per-interval number, so it cannot
-        #: be correct for both. It is set for k = 0, where it actually binds
-        #: against the applied control; the tail is consequently ten times too
-        #: permissive, which weakens the feasibility certificate without
-        #: affecting the action. The clean fix is to express slew per second and
-        #: scale each row by its own gap.
+        #: **Caveat:** the k = 0 rate-limit row then spans 600 s while the k > 0
+        #: rows span 60 s, and `rate_limit` is one per-interval number. It is
+        #: set for k = 0, where it binds against the applied control, so the
+        #: tail is ten times too permissive -- a weaker feasibility certificate,
+        #: but the same action. The clean fix is slew per second, scaled per row.
         resolve_interval_s: float | None = 600.0,
         nmpc_max_iter: int = 500,
-        #: `"filter"` is the safety-filter formulation (see
-        #: `docs/DISPATCH_NMPC.md` §5): minimal edit to the plan's proposed
-        #: action, every conflicting inequality carrying an unbounded slack, no
-        #: economics. `"tracking"` is the previous behaviour.
+        #: `"filter"` is the shipped formulation (`docs/DISPATCH_NMPC.md`):
+        #: minimal edit to the plan's action, unbounded slack on every
+        #: conflicting inequality, no economics.
         objective: str = "filter",
         name: str | None = None,
     ) -> None:
@@ -167,10 +139,9 @@ class DispatchNMPCController(Controller):
             self._diagnostics.update(nmpc_used=0.0, nmpc_failed=0.0)
             return plan_request
 
-        # Hold the last solution across the control steps inside one interval.
-        # The setpoint it produced is a zero-order hold over `nmpc_dt_s`, so
-        # re-deriving it every control step solves the same problem repeatedly
-        # against a state that has barely moved.
+        # Hold the last solution across the control steps inside one interval:
+        # re-solving would pose the same problem against a state that has
+        # barely moved.
         if t < self._next_solve_s and self._held is not None:
             self._diagnostics.update(nmpc_used=1.0, nmpc_failed=0.0, nmpc_held=1.0)
             return self._held
@@ -193,9 +164,8 @@ class DispatchNMPCController(Controller):
 
         if solution.stats is None or not solution.stats.success:
             self._nmpc_failures += 1
-            # Record *why*, not just that. A failure path that reports only a
-            # flag is how 83 % of solves failed silently behind a fallback that
-            # still produced plausible-looking results.
+            # Record *why*, not just that: a flag-only failure path is how 83 %
+            # of solves once failed silently behind a plausible-looking fallback.
             status = "none" if solution.stats is None else str(solution.stats.status)
             self._failure_reasons[status] = self._failure_reasons.get(status, 0) + 1
             self._diagnostics.update(
@@ -240,16 +210,10 @@ class DispatchNMPCController(Controller):
     def _reference_action(self, plan, t: float) -> np.ndarray:
         """The complete action the dispatch layer proposes, in plant units.
 
-        This is what a safety filter minimally edits, so it has to be *all* of
-        it -- the four process setpoints with their enables, both battery
-        channels, and the curtailment fraction. The tracking formulation used
-        only the committed setpoints and left battery and curtailment free,
-        which meant the inner layer was re-deciding two channels rather than
-        filtering them.
-
-        Every component is already published: `Band.dispatch` carried the LP's
-        intended setpoint and was read by nothing, and `plan.battery_W` and
-        `plan.curtail` were in the same position.
+        A safety filter edits *all* of it -- the four process setpoints with
+        their enables, both battery channels and the curtailment fraction --
+        because a channel left out of the reference is one the inner layer is
+        re-deciding rather than filtering.
         """
         nmpc = self.nmpc
         u = np.zeros(nmpc._n_u, dtype=float)
@@ -277,10 +241,9 @@ class DispatchNMPCController(Controller):
     def _price_window(self, plan, t: float) -> np.ndarray:
         """Lambda at each NMPC interval.
 
-        Carried for reporting and for the failure path, not for the objective:
-        the inner stage cost does not price energy. Sampled rather than
-        interpolated, because a dual is genuinely piecewise-constant on the
-        dispatch layer's grid.
+        Reporting and the failure path only -- the inner stage cost does not
+        price energy. Sampled rather than interpolated, because a dual is
+        piecewise-constant on the dispatch layer's grid.
         """
         return np.array(
             [plan.price_at(t + k * self.nmpc_dt_s) for k in range(self.nmpc.n_steps)],
@@ -298,11 +261,10 @@ class DispatchNMPCController(Controller):
     def _targets_from(self, plan, t: float):
         """Where the plan expects the buffers at the end of the inner horizon.
 
-        Targets only -- no prices. In tracking mode the inner layer needs to
-        know *where* the plan wants the inventories, not what they are worth:
-        the worth was settled by the dispatch LP when it chose that trajectory,
-        and re-deriving it here would be the same number computed twice, in a
-        layer that is supposed to make no economic decision at all.
+        Targets only, never prices: what a banked mole is worth was settled by
+        the dispatch LP when it chose the trajectory, and re-deriving it here
+        would put an economic decision in the layer that must make none. Unused
+        in filter mode, which carries no terminal term.
         """
         z_target = plan.target_at(t + self.nmpc_horizon_s)
         return {full: float(z_target[zi(reduced)])

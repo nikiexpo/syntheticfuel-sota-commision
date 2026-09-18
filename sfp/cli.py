@@ -50,18 +50,10 @@ REFERENCE_SITES = {
 
 
 #: The reference design point. **One definition, used everywhere** -- the CLI's
-#: defaults, every test fixture, and the bookkeeping scripts all read it from
-#: here.
-#:
-#: This exists because they had drifted apart: the CLI defaulted to a 1000 kWh /
-#: 400 kW battery while the tests and the sizing audit used 1500 / 750, and a
-#: closed-loop result was compared against a baseline measured on a different
-#: plant over a different window. The comparison was meaningless and it took a
-#: while to notice, because both numbers were individually correct.
-#:
-#: The values come from the material-flow audit in `bookkeeping/03_SIZING.md`.
-#: Changing anything here changes every simulation in the project, which is the
-#: point.
+#: defaults, every test fixture and every experiment read it from here, so a
+#: closed-loop result and its baseline cannot be measured on different plants.
+#: Values come from a material-flow audit; see `docs/ASSUMPTIONS.md`. Changing
+#: anything here changes every simulation in the project.
 REFERENCE_SIZING: dict[str, float] = {
     "pv_kwp": 1100.0,
     "battery_kwh": 1500.0,
@@ -96,10 +88,9 @@ def build_plant(
     before the reactor throttles against them. `Plant` validates this at
     construction, so a wrong order raises rather than silently producing zeros.
 
-    `reactor_feed_mol_s` defaults to the value in `sabatier.yaml`, which is sized
-    against the electrolyser's round-the-clock hydrogen supply rather than
-    against the reactor's own capability -- see the note there and
-    `bookkeeping/03_SIZING.md`.
+    `reactor_feed_mol_s` defaults to the value in `sabatier.yaml`, sized against
+    the electrolyser's round-the-clock hydrogen supply rather than against the
+    reactor's own capability -- see the note there.
     """
     sabatier_params = load_params("sabatier")
     if reactor_feed_mol_s is not None:

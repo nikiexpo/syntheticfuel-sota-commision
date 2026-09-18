@@ -1,21 +1,18 @@
 """The controller interface.
 
 Every strategy -- the greedy baseline, the rule-based PLC emulation, the
-perfect-foresight oracle, and the hierarchical economic MPC that is the point of
-the project -- implements this one interface and is therefore directly
-comparable. Nothing else about the simulation changes between runs, so a
-difference in the report is a difference in the control strategy and not in the
-harness.
+perfect-foresight oracle, and the hierarchical economic MPC -- implements this
+one interface and is therefore directly comparable. Nothing else about the
+simulation changes between runs, so a difference in the report is a difference
+in the control strategy and not in the harness.
 
 A controller sees:
 
-    t          seconds since the start of the run
-    state      the *estimated* plant state (in M0 this is the true state; from
-               M5 it comes from the moving-horizon estimator, and the difference
-               starts to matter)
-    measurement the current noisy sensor readings and weather
-    forecast   a WeatherSeries view of the future -- imperfect unless the
-               controller is the oracle
+    t           seconds since the start of the run
+    state       the plant state, by subsystem
+    measurement current sensor readings and weather
+    forecast    a WeatherSeries view of the future -- imperfect unless the
+                controller is the oracle
 
 and returns a `Request`, which the DC bus then makes feasible. A controller is
 never allowed to write plant state directly.

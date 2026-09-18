@@ -4,18 +4,16 @@
     battery state over time
     energy lost through curtailment
     the limiting subsystem
-    responses to at least one injected fault          (M2 onwards)
 
 plus a comparison against a simple baseline. Computed once here so the report,
-the baseline table and the siting sweep cannot disagree.
+the baseline table and the sizing sweeps cannot disagree.
 
 The limiting subsystem
 ----------------------
-With real buffers this becomes the most informative number in the report, and it
-is emphatically not a static property of the design -- what limits the plant
-changes hour by hour, and the answer differs between control strategies on
-identical hardware. So it is classified per timestep and reported as a time
-distribution plus a daylight headline.
+Not a static property of the design: what limits the plant changes hour by hour
+and differs between control strategies on identical hardware. So it is
+classified per timestep and reported as a time distribution plus a daylight
+headline.
 
 The diagnosis asks "what stopped the reactor making more methane right now?" and
 the candidate answers are genuinely different engineering problems:
@@ -255,18 +253,12 @@ def compute_metrics(
     annual_ch4 = ch4_kg * scale
     water_consumed = final("water_consumed_kg")
     battery_efc = final("battery_efc")
-    # Battery replacement, in two disjoint parts.
-    #
-    # The cycle-attributable part is what the controller already pays through
-    # `cost_per_kWh_delivered` on every kWh moved; over a pack's rated cycle life
-    # those charges total exactly one pack.
-    #
-    # The calendar-attributable part is paid by nobody. The capital annuity
-    # amortises the battery over the project's 25 years and the pack does not
-    # last them -- 13.3 years on calendar fade alone, and about five at two
-    # equivalent full cycles a day. Counting only the first part understated the
-    # cost of storage; counting the whole replacement in both places would
-    # double-charge the cycling.
+    # Battery replacement, in two disjoint parts. The cycle-attributable part is
+    # what the controller already pays through `cost_per_kWh_delivered`; over a
+    # pack's rated cycle life those charges total exactly one pack. The
+    # calendar-attributable part is paid by nobody -- the capital annuity
+    # amortises the pack over 25 years and it lasts 13.3 on calendar fade alone.
+    # Counting the whole replacement in both places would double-charge cycling.
     battery = plant["battery"]
     annual_battery_cost = battery.cost_per_efc_EUR() * battery_efc * scale
     efc_per_year = battery_efc * scale

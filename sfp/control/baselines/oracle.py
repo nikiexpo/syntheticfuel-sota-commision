@@ -6,31 +6,19 @@ forecast-driven strategy could have achieved, and lets the report quote **regret
 
     regret = J_oracle - J_controller
 
-A bound is worth more than another baseline. Beating greedy says little if greedy
-is bad; sitting close to the oracle says the remaining loss is forecast error
-rather than bad scheduling, and that is the honest way to describe how good a
-controller is.
+Beating greedy says little if greedy is bad; sitting close to the oracle says
+the remaining loss is forecast error rather than bad scheduling.
 
-What kind of bound this actually is
------------------------------------
-Two limits, both deliberate, and both of which make this a *conservative* bound
--- the true optimum is at least this good, so real regret is at least what gets
-reported.
+Two deliberate limits, both of which make this a *conservative* bound -- the
+true optimum is at least this good, so reported regret is understated:
 
-**The oracle re-plans.** It is not solved once over the whole run. Its horizon is
-the planner's horizon, so at any moment it sees the truth for the next seven days
-and nothing beyond. A genuine open-loop optimum over a ten-day run would need a
-240-hour solve, which does not converge (see
-`bookkeeping/04_PLANNER_TRACTABILITY.md`). So this is "perfect foresight over a
-seven-day rolling window", not "perfect foresight over everything".
+**It re-plans.** Its horizon is the planner's, so it sees the truth for the next
+seven days and nothing beyond. A genuine open-loop optimum over a ten-day run
+needs a 240-hour solve, which does not converge. So this is perfect foresight
+over a rolling seven-day window, not over everything.
 
-**It is still a relaxation, solved to a local optimum.** The commitment variables
-are relaxed and rounded exactly as the planner's are, and IPOPT returns a local
-solution to a non-convex problem. Nothing here proves global optimality.
-
-Both caveats mean the gap to the true optimum is understated, never overstated.
-Stated plainly because an "oracle" that is quietly not one would make every regret
-number in the report wrong in the flattering direction.
+**It is still a relaxation.** Commitment variables are relaxed and rounded as
+the planner's are, and IPOPT returns a local solution to a non-convex problem.
 """
 
 from __future__ import annotations
@@ -51,11 +39,9 @@ class PerfectForesightOracle(EconomicPlanner):
     def reset(self, context: ControlContext) -> None:
         """Swap the degraded forecast for the truth before planning starts.
 
-        `ControlContext.metadata['truth']` is set by the simulator. If it is
-        missing this raises rather than silently falling back to the forecast --
-        an oracle running on a forecast is not an oracle, it is the planner under
-        a different name, and it would report a regret of approximately zero and
-        look like a triumph.
+        `ControlContext.metadata['truth']` is set by the simulator. Missing, this
+        raises rather than falling back to the forecast: an oracle on a forecast
+        is the planner under another name, reporting a regret of ~zero.
         """
         truth = context.metadata.get("truth")
         if truth is None:

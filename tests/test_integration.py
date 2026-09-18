@@ -3,11 +3,8 @@
 Everything here uses synthetic weather so the suite runs offline and
 deterministically. The point is not to validate against a real site -- the PVGIS
 runs do that -- but to guarantee that the harness conserves what it should, that
-the subsystem coupling actually works, and that results do not drift silently
-between refactors.
-
-Runs are short (2 days) because the coupled plant is ~50x more expensive to
-integrate than the M0 placeholder.
+the subsystem coupling works, and that results do not drift silently between
+refactors. Runs are short (2 days) because the coupled plant is expensive.
 """
 
 from __future__ import annotations

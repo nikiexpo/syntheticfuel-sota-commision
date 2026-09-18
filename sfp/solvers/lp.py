@@ -1,10 +1,8 @@
 """A linear-programming seam, separate from the NLP backend.
 
-`sfp.solvers.backend` exists so the inner NMPC's nonlinear solver can be swapped
-at M7. This is a different animal and deliberately not forced through the same
-interface: an LP has no initial guess, no iteration count worth reporting, and a
-dual convention of its own. Pretending otherwise would put a nonlinear shape on
-a linear problem for no benefit.
+Deliberately not forced through `sfp.solvers.backend`: an LP has no initial
+guess, no iteration count worth reporting and a dual convention of its own, so
+sharing the interface would put a nonlinear shape on a linear problem.
 
 HiGHS via `scipy.optimize.linprog` is the default and the only implementation.
 It is bundled with SciPy, so this adds no dependency.
@@ -253,15 +251,11 @@ def _highs(problem: LPProblem, time_limit_s: float):
     )
     # Fold the split rows back: for a two-sided row only one side can be active.
     #
-    # Guarded, because this solve can fail. Fixing a MILP's integer columns at
-    # `round(x)` can leave the continuous problem infeasible when the solver
-    # reported a value a hair off integral, and HiGHS then returns no marginals
-    # at all -- a zero-dimensional array rather than an empty one. Unguarded the
-    # slice raises, which took down a 300-cell sweep on its 69th cell.
-    #
-    # Duals are a diagnostic here, not a decision input: the tracking inner layer
-    # does not price energy. Losing them for one replan is acceptable; losing the
-    # run is not.
+    # Guarded, because this solve can fail: fixing a MILP's integers at
+    # `round(x)` can leave the continuous problem infeasible when a value came
+    # back a hair off integral, and HiGHS then returns a zero-dimensional
+    # marginals array. Duals are a diagnostic here, not a decision input, so
+    # losing them for one replan is acceptable; losing the run is not.
     marg = getattr(getattr(res, "ineqlin", None), "marginals", None)
     if marg is not None and np.ndim(marg) == 1 and len(marg) == 2 * problem.n_g:
         marg = np.asarray(marg, dtype=float)

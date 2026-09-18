@@ -1,18 +1,15 @@
 """Battery: an energy reservoir with a differentiable capacity-fade state.
 
-Charge and discharge are kept as two separate non-negative inputs rather than
-one signed power. That is deliberate: a signed power needs `abs()` for the
-throughput and efficiency terms, and `abs()` puts a kink right at the operating
-point the solver spends most of its time near. Two non-negative variables make
-the whole model smooth, at the cost of admitting the unphysical
-simultaneous-charge-and-discharge solution -- which never appears in practice
-because both directions lose energy, so it is always dominated.
+Charge and discharge are two separate non-negative inputs rather than one signed
+power: a signed power needs `abs()` for the throughput and efficiency terms, and
+that kink sits exactly where the solver spends its time. The cost is admitting
+simultaneous charge and discharge, which never appears because both directions
+lose energy and the solution is always dominated.
 
 Fade is a state, not a post-processing step, so the planner can see that cycling
-the battery today costs capacity tomorrow. Together with the sorbent-deactivation
-state in the carbonator this is what stops the controller from behaving like the
-greedy baseline: every buffer in this plant wears out, and the wear rates differ
-by orders of magnitude.
+today costs capacity tomorrow. Together with sorbent deactivation, this is what
+separates the controller from the greedy baseline: every buffer here wears out,
+at rates differing by orders of magnitude.
 """
 
 from __future__ import annotations

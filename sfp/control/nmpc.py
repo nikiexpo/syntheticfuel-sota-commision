@@ -1,50 +1,25 @@
-"""The inner NMPC (layer 3) -- the local problem, solved at the planner's price.
+"""The inner NMPC -- all dynamics, no economics.
 
-This layer does **not** track setpoints. It solves a small economic problem over
-a short horizon on the full sixteen-state model:
-
-    max  sum_l dt [ p_CH4 * r_sab * M_CH4  -  lambda(t_l) * P_process ]
-         + sum_i pi_i * (x_N,i - x_i^target)
-
+Solves a small problem over a short horizon on the full sixteen-state model,
 subject to the real nonlinear dynamics, the DC bus balance, the hard temperature
-limits and rate limits on every input.
+limits and rate limits on every input. Three objectives are available:
 
-Why price coordination rather than setpoint tracking
-----------------------------------------------------
-The plan is *always* wrong, because the forecast is always wrong. If the planner
-says "kiln at 340 kW at 14:00" and a cloud bank arrives, tracking that setpoint is
-actively harmful: the NMPC would drain the battery to hit a number computed under
-conditions that no longer exist. Telling it instead that "electricity is worth
-0.054 EUR/kWh right now, and you need this much CaCO3 banked by dawn" lets it
-respond sensibly to a situation the planner never saw.
+    "filter"    the shipped design: minimise ||u_0 - u_plan||^2 plus exact
+                penalty slacks, so the layer edits the dispatch layer's action
+                just far enough to be feasible and decides nothing else.
+                See `docs/DISPATCH_NMPC.md`.
+    "economic"  maximise operating profit at the planner's shadow price.
+                Used by `HierarchicalController`.
+    "tracking"  follow the plan's setpoint bands. Superseded by "filter".
 
-Three consequences, and the first is why the architecture is shaped this way:
+The model is the plant's own: `Plant.rhs` and `Plant.step(clip=False)` are
+evaluated symbolically here, the same coupled two-phase evaluation the simulator
+integrates. There is no second copy of the dynamics to drift out of step.
 
-1. **The multiscale problem dissolves.** The inner layer never needs the
-   planner's time grid, its horizon, or its reduced state vector. It needs one
-   number per instant and a handful of terminal prices.
-2. **Graceful degradation.** A stale plan still yields a sensible price; a stale
-   setpoint trajectory does not.
-3. It is the Lagrangian decomposition of the full problem rather than a
-   heuristic hand-off, so the two layers are solving one problem between them.
-
-The model is the plant's own
-----------------------------
-`Plant.rhs` and `Plant.step(clip=False)` are evaluated symbolically here -- the
-same coupled two-phase evaluation the simulator integrates, with the same
-parameters. There is no second copy of the dynamics to drift out of step. (The
-*truth* simulator's parameters are perturbed away from these at M5; that mismatch
-is the point, and it arrives through the plant this controller is handed, not
-through a re-typed model.)
-
-Fast, because it has to be
---------------------------
-This solves once per control interval, which over a ten-day run at five-minute
-cadence is 2880 solves. A horizon of 1 h at 5 min is 12 intervals -- about 320
-variables -- and it is warm-started from the previous solve shifted by one step,
-which is the standard MPC trick and is worth an order of magnitude here. The
-horizon is short deliberately: the planner already carries the long view, and
-that division of labour is the entire reason for having two layers.
+Speed matters -- a seven-day run at five-minute cadence is 2016 solves -- so the
+horizon is short (the outer layer carries the long view), the problem is
+warm-started from the previous solve shifted by one interval, and the CasADi
+graph is expanded to SX. Measured 0.511 s per solve at 5 min / 1 min.
 """
 
 from __future__ import annotations
@@ -66,38 +41,29 @@ BUS_BALANCE = "bus_balance"
 
 #: Lower bound on every penalised slack, instead of exactly zero.
 #:
-#: IPOPT relaxes each bound by `bound_relax_factor * max(1, |bound|)`, default
-#: 1e-8, so a slack declared `lb = 0` may sit at -1e-8. That is numerically
-#: nothing -- until it is multiplied by an exact-penalty weight of 1e6, at which
-#: point it contributes -0.06 to an objective whose edit term is 0.003. Measured:
-#: `shed` and `state_slack` together supplied -0.26 of a -0.254 objective, 86x
-#: the term the filter is supposed to be minimising, so the solver's strongest
-#: gradient pointed at mining bound tolerance rather than at editing the plan.
+#: IPOPT relaxes each bound by `bound_relax_factor * max(1, |bound|)` (default
+#: 1e-8), so a slack declared `lb = 0` may sit at -1e-8 and be *paid* for it at
+#: a penalty weight of 1e6. Measured: `shed` and `state_slack` together supplied
+#: -0.26 of a -0.254 objective, 86x the edit term the filter is meant to
+#: minimise, so the strongest gradient pointed at mining bound tolerance.
 #:
-#: Setting the bound to the relaxation width makes the *relaxed* bound exactly
-#: zero: 1e-8 - 1e-8 * max(1, 1e-8) = 0. The slack can still reach zero, so no
-#: constant offset is introduced, but it can no longer go negative and be paid
-#: for it. Cheaper than `bound_relax_factor = 0`, which removes a relaxation the
-#: barrier method wants and measured 39 % slower.
+#: Setting the bound to the relaxation width makes the relaxed bound exactly
+#: zero (1e-8 - 1e-8 * max(1, 1e-8) = 0): the slack still reaches zero, so no
+#: constant offset, but it can no longer go negative. Cheaper than
+#: `bound_relax_factor = 0`, which measured 39 % slower.
 SLACK_FLOOR = 1e-8
 
 #: State-name suffixes that get no soft box in filter mode.
 #:
 #: The soft state box is the largest block in the problem -- 174 of 360 columns
-#: at the default horizon, plus a constraint row each -- and most of it protects
-#: states that cannot reach a bound inside a five-minute horizon no matter what
-#: the controller does. Two structural kinds:
+#: at the default horizon, plus a row each -- and most of it protects states
+#: that cannot reach a bound in five minutes. Two kinds: monotone accumulators
+#: (`efc`, `consumed_kg`, `ch4_kg`), which only increase away from their lower
+#: bound and have no upper one; and degradation states (`fade`, `cycle_number`,
+#: `v_degradation`, `catalyst_activity`), which move over weeks.
 #:
-#: * **Monotone accumulators** (`efc`, `consumed_kg`, `ch4_kg`): they only ever
-#:   increase, so the lower bound of zero they start above is unreachable, and
-#:   they have no upper bound at all.
-#: * **Degradation states** (`fade`, `cycle_number`, `v_degradation`,
-#:   `catalyst_activity`): these move on timescales of weeks. Their bounds are
-#:   real, but nothing a filter decides in five minutes can approach one.
-#:
-#: Excluded states keep their **hard** box, which is the safe direction: a slack
-#: that can never be needed is removed, not a constraint. If a horizon long
-#: enough to move these is ever wanted, this list is what has to change.
+#: Excluded states keep their **hard** box: a slack that can never be needed is
+#: removed, not a constraint. A longer horizon would mean revisiting this list.
 SLOW_STATES: frozenset[str] = frozenset({
     "fade", "efc", "cycle_number", "v_degradation", "consumed_kg", "ch4_kg",
     "catalyst_activity",
@@ -107,14 +73,9 @@ SLOW_STATES: frozenset[str] = frozenset({
 def _shift(values: np.ndarray, steps: int, stride: int | None) -> np.ndarray:
     """Advance a stacked per-interval trajectory by one interval.
 
-    `values` is `steps` blocks of `stride` entries. The result drops the first
-    block and repeats the last, which is the guess a receding horizon implies:
-    what was predicted for interval k+1 is now the prediction for interval k,
-    and the new final interval has no predecessor to copy but its own.
-
-    Blocks with no per-interval structure (`stride is None`) are returned
-    unchanged -- the slacks, whose previous values are still a reasonable
-    starting point but have no meaningful ordering to advance.
+    `values` is `steps` blocks of `stride` entries. Drops the first block and
+    repeats the last, which is the guess a receding horizon implies. Blocks
+    with no per-interval structure (`stride is None`) pass through unchanged.
     """
     if stride is None or steps < 2 or values.size != steps * stride:
         return values
@@ -159,8 +120,8 @@ class InnerNMPC:
     """Short-horizon economic NMPC on the full plant model.
 
     Not a `Controller`: it has no opinion about when to re-plan and no access to
-    a forecast beyond what it is handed. `HierarchicalController` owns both this
-    and the planner and wires the price between them.
+    a forecast beyond what it is handed. `DispatchNMPCController` (or
+    `HierarchicalController`) owns both this and the outer layer.
     """
 
     def __init__(
@@ -178,64 +139,40 @@ class InnerNMPC:
         #: Price charged for predicting a load shed, EUR/kWh. Against a shadow
         #: price of order 0.05 this is a hundredfold penalty, so shedding is a
         #: genuine last resort rather than a cheap way out of a tight hour.
-        #: Used by the economic objective only; the tracking one uses
-        #: `shed_weight`, which carries no units.
+        #: Economic objective only; "tracking" uses the unitless `shed_weight`.
         shed_penalty_EUR_per_kWh: float = 5.0,
-        #: `"economic"` maximises operating profit -- the original formulation,
-        #: kept because `HierarchicalController` is built around it.
-        #:
-        #: `"tracking"` is the proposed architecture: the inner layer makes no
-        #: economic decision at all. Every euro lives in the dispatch LP, and
-        #: this layer only has to realise the strategy it is handed on the real
-        #: sixteen-state dynamics, at five-minute resolution, without violating
-        #: anything. See `_tracking_objective`.
+        #: `"filter"`, `"economic"` or `"tracking"`. See the module docstring.
         objective: str = "economic",
-        #: Tracking mode weights, all dimensionless. Setpoint deviation is
-        #: O(1) because controls are scaled to their own bounds; inventory
-        #: deviation is normalised by the state scale, so a 10 % drift on a
-        #: buffer costs `0.01 * terminal_weight` against a full setpoint
-        #: deviation's `setpoint_weight`. The defaults make a 10 % inventory
-        #: drift equal to one saturated setpoint.
+        #: --- tracking mode -------------------------------------------------
+        #: Dimensionless. Setpoint deviation is O(1) because controls are scaled
+        #: to their own bounds; inventory deviation is normalised by the state
+        #: scale, so a 10 % buffer drift contributes 0.01 and needs a weight of
+        #: 100 to match one saturated setpoint.
         setpoint_weight: float = 1.0,
-        #: Tracking mode only, so the economic path that `HierarchicalController`
-        #: uses keeps its own `terminal_weight` untouched. 100 is what the
-        #: comment above actually implies: inventory deviation is normalised
-        #: by the state scale, so a 10 % drift contributes 0.01 and needs a
-        #: weight of 100 to match one saturated setpoint. Left at 1.0 it is a
-        #: hundredfold too weak, and the layer will drain a buffer to its floor
-        #: rather than give up a setpoint -- which is what it did.
         tracking_terminal_weight: float = 100.0,
-        #: Weight on a soft band excursion. Between tracking and shed by two
-        #: orders each way: a ramp that overshoots the plan's ceiling for an
-        #: interval must dominate ordinary tracking error, and must never
-        #: compete with keeping the bus supplied.
+        #: Band excursion: two orders above tracking error, two below shed.
         band_weight: float = 1.0e2,
         shed_weight: float = 1.0e4,
         #: --- filter mode ---------------------------------------------------
-        #: Exact-penalty weights. Ordered by what a violation actually means:
-        #: overshooting a plan band or a slew limit while ramping is a nuisance;
-        #: leaving a state box is a safety matter; failing to supply the bus is
-        #: the thing this layer exists to prevent. Each must be large enough
-        #: that the violation is preferred only over infeasibility, and the edit
-        #: term is O(1) by construction, so these are absolute.
+        #: Exact-penalty weights, ordered by what a violation means: a band or
+        #: slew overshoot while ramping is a nuisance, leaving a state box is a
+        #: safety matter, failing to supply the bus is what this layer exists to
+        #: prevent. The edit term is O(1) by construction, so these are absolute.
         filter_rho_band: float = 1.0e3,
         filter_rho_rate: float = 1.0e3,
         filter_rho_state: float = 1.0e5,
         filter_rho_shed: float = 1.0e6,
-        #: Tail regularisation only. Present so the horizon past u_0 is
-        #: well-posed, and small enough that it cannot shape u_0 -- which is the
-        #: only thing a filter is allowed to decide.
+        #: Tail regularisation, present so the horizon past u_0 is well-posed
+        #: and small enough that it cannot shape u_0 itself.
         filter_epsilon: float = 1.0e-3,
-        #: How far outside its true box a state variable may range before the
-        #: *variable* bound bites, as a fraction of the box span. The soft rows
-        #: sit at the true bounds; this is only here to keep the NLP bounded.
+        #: How far outside its true box a state *variable* may range, as a
+        #: fraction of the box span. The soft rows sit at the true bounds; this
+        #: only keeps the NLP bounded.
         filter_state_margin: float = 0.25,
         #: Drop the soft box on states that cannot reach a bound within the
         #: horizon. See `SLOW_STATES`.
         filter_trim_slacks: bool = True,
         #: Advance the stored solution by one interval before reusing it.
-        #: Off reproduces the previous behaviour, which reused the vector
-        #: as-is -- every entry one interval stale. See `_warm_start`.
         warm_shift: bool = True,
     ) -> None:
         self.plant = plant
@@ -288,16 +225,13 @@ class InnerNMPC:
     def _build_step_function(self) -> ca.Function:
         """Compile `(x, u, w) -> (x_next, bus_total, process_power, r_CH4)`.
 
-        Built once and *called* at each interval, rather than letting
-        `Plant.step` inline itself into the NLP twelve times over. The
-        difference is not marginal: one RK4 step is four full two-phase
-        evaluations of a nine-subsystem coupled plant, so inlining puts
-        forty-eight of them in a single expression graph, and both construction
-        and every subsequent derivative evaluation pay for all of it. As a
-        `ca.Function` it is one node that CasADi differentiates once.
+        Built once and *called* per interval rather than inlining `Plant.step`
+        into the NLP at every step. One RK4 step is four full two-phase
+        evaluations of a nine-subsystem plant, so inlining would put dozens of
+        them in one graph and pay for all of it on every derivative evaluation.
 
-        Weather enters as a vector rather than a dict so that it can be an
-        argument; the keys are the plant's own `WEATHER_KEYS`, in a fixed order.
+        Weather enters as a vector rather than a dict so it can be an argument;
+        the keys are the plant's own `WEATHER_KEYS`, in a fixed order.
         """
         x = ca.MX.sym("x", self.n_x)
         u = ca.MX.sym("u", self._n_u)
@@ -332,16 +266,12 @@ class InnerNMPC:
     def _state_scale(self) -> np.ndarray:
         """Characteristic magnitude of each of the sixteen states.
 
-        The NMPC is solved non-dimensionally for the same reason the planner is:
-        the raw state vector runs from 0.5 (state of charge) through 1173
+        The raw state vector runs from 0.5 (state of charge) through 1173
         (kelvin) to 42,000 (moles of CaO), and IPOPT's convergence test is one
-        norm over all of them. Unscaled, this problem hit its iteration limit
-        on every solve.
-
-        The scale is taken from whichever of the state's own upper bound or its
-        initial value is larger, floored at one. That is crude next to a
-        hand-tuned vector, but it is derived from the plant rather than typed in,
-        so it cannot go stale when a subsystem is resized.
+        norm over all of them; unscaled, this problem hit its iteration limit on
+        every solve. The scale is the larger of the state's upper bound and its
+        initial value, floored at one -- crude, but derived from the plant, so
+        it cannot go stale when a subsystem is resized.
         """
         x0 = np.abs(np.asarray(self.plant.initial_state(), dtype=float))
         bound = np.where(np.isfinite(self._x_hi), np.abs(self._x_hi), 0.0)
@@ -383,12 +313,10 @@ class InnerNMPC:
     def _guess_u(self) -> np.ndarray:
         """A mid-range starting control vector.
 
-        All-zeros means every subsystem off and no curtailment, which violates
-        the bus balance by the full array output at midday and sits the
-        commitment variables exactly on a bound. Starting at half-open with
-        everything enabled is closer to any plausible answer and, more usefully,
-        is interior -- the barrier does not have to push off a face before it can
-        make progress.
+        All-zeros violates the bus balance by the full array output at midday
+        and sits the commitment variables exactly on a bound. Half-open with
+        everything enabled is closer to any plausible answer and is interior,
+        so the barrier does not have to push off a face first.
         """
         u = np.zeros(self._n_u)
         for key in self._input_keys:
@@ -428,30 +356,23 @@ class InnerNMPC:
     def _bind_bands(self, bands: Mapping[str, Any]):
         """Apply the dispatch layer's bands. Returns `(lo, hi, guess, ceilings)`.
 
-        Commitment is a *bound*, which is the point of banding rather than
-        flagging: handed down as a flag it becomes a variable sitting on a
-        near-discontinuous gate, handed down as a bound it costs no variable and
-        no smoothing. Per subsystem:
+        Commitment is a *bound*, not a flag: as a flag it becomes a variable on
+        a near-discontinuous gate, as a bound it costs no variable and no
+        smoothing. Per subsystem:
 
             committed      enable pinned to 1, setpoint ceiling enforced softly
             not committed  enable and setpoint both pinned to 0
 
-        **The ceiling is soft, and that is not a convenience.** A setpoint is
-        slew-limited -- the plant models no actuator dynamics at all, so the
-        NMPC's rate limit is the only thing standing in for a valve that cannot
-        jump. When a band narrows faster than the actuator can follow, a hard
-        ceiling and the rate limit have no feasible point between them: measured,
-        115 of 216 solves returned `Infeasible_Problem_Detected`.
+        **The ceiling is soft, and not as a convenience.** The NMPC's rate limit
+        stands in for actuator dynamics the plant model omits, so when a band
+        narrows faster than the actuator can follow, a hard ceiling and the rate
+        limit have no feasible point between them -- measured, 115 of 216 solves
+        returned `Infeasible_Problem_Detected`. The physically correct response
+        to a ceiling dropping 0.9 -> 0.2 is a ramp that spends two intervals
+        above the band; a soft ceiling admits it and prices the excursion.
 
-        The physically correct response to a ceiling dropping from 0.9 to 0.2 is
-        a ramp -- 0.56, 0.22, 0.20 -- which necessarily spends two intervals
-        above the band. A soft ceiling admits exactly that trajectory and prices
-        the excursion, so the solver converges to the band as fast as the slew
-        allows and no faster.
-
-        The lower edge stays hard, because it is realised by the enable pin: a
-        committed machine draws its idle load as a consequence of being
-        energised, which is discrete and not slew-limited.
+        The lower edge stays hard: it is realised by the enable pin, and a
+        committed machine's idle draw is discrete, not slew-limited.
 
         `ceilings` is NaN wherever no ceiling applies.
         """
@@ -473,10 +394,9 @@ class InnerNMPC:
                 lo[i_s] = hi[i_s] = guess[i_s] = 0.0
                 continue
             lo[i_e] = hi[i_e] = guess[i_e] = 1.0
-            # The ceiling is NOT written into `hi` -- it is enforced softly, as a
-            # penalised row, because a hard box on a slew-limited control is
-            # infeasible the moment the band narrows faster than the actuator can
-            # follow. `ceilings` carries it to the constraint builder.
+            # NOT written into `hi`: enforced softly as a penalised row, since a
+            # hard box on a slew-limited control is infeasible the moment the
+            # band narrows faster than the actuator can follow.
             ceilings[i_s] = float(np.clip(band.setpoint_max, 0.0, hi[i_s]))
             guess[i_s] = float(np.clip(guess[i_s], lo[i_s], ceilings[i_s]))
         return lo, hi, guess, ceilings
@@ -486,13 +406,9 @@ class InnerNMPC:
 
         Only the four process setpoints. The battery and the curtailment
         fraction are deliberately *not* tracked: they are the balancing degrees
-        of freedom that close the bus in real time against weather the dispatch
-        layer forecast an hour ago, and pinning them to a plan would remove the
-        one thing the inner layer is there to do. Enables are already pinned by
-        the band, so tracking them would be redundant.
-
-        A decommitted machine has its setpoint pinned to zero by the band, so it
-        contributes nothing either way.
+        of freedom that close the bus in real time, and pinning them to a plan
+        would remove the one thing the inner layer is there to do. Enables are
+        already pinned by the band.
         """
         cols: list[int] = []
         values: list[float] = []
@@ -522,34 +438,22 @@ class InnerNMPC:
                       process_only: bool = False) -> list[int]:
         """Which control columns the rate limit may be applied to.
 
-        **`process_only` excludes the battery and the curtailment fraction**,
-        and that exclusion is the point of the argument. Neither has a physical
-        slew limit worth modelling -- a converter responds in milliseconds, and
-        curtailment is a firing-angle change -- yet both were being limited to
-        34 % of span per interval. Those are precisely the two channels whose
-        purpose is to close the bus balance in real time, so limiting them
-        manufactures the imbalance that the shed slack then has to absorb.
+        Three exclusions:
 
-        The limit is meaningful for the four process setpoints, which stand in
-        for valves and heaters the plant model does not represent at all.
+        **`process_only` excludes the battery and the curtailment fraction.**
+        Neither has a slew limit worth modelling -- a converter responds in
+        milliseconds -- and they are precisely the channels that close the bus
+        in real time, so limiting them manufactures the imbalance the shed slack
+        then absorbs. The limit is meaningful only for the four process
+        setpoints, which stand in for valves and heaters the model omits.
 
-        Two further exclusions, and the second was a real defect.
+        **Enables are never rate-limited.** Commitment is a discrete event.
 
-        **Enables are never rate-limited.** Commitment is a discrete event -- a
-        machine is either energised or it is not -- so bounding how fast an
-        enable may change is meaningless in the first place.
-
-        **A pinned control cannot move, so constraining its rate cannot help and
-        can only hurt.** Once the dispatch layer pins an enable, the rate row
-        against `last_u` demands |0 - 1| = 1.0 against a limit of 0.34. The
-        feasible set is then *empty*, and IPOPT says so in seven iterations.
-
-        That is what made 846 of 864 solves fail in the first banded run, and it
-        failed in the worst possible way: every failure fell back silently to the
-        dispatch layer's own request, so the run completed, reported no error,
-        and produced results bit-identical to the layer below it. An inner layer
-        that is doing nothing at all looks exactly like an inner layer that is
-        adding nothing -- `nmpc_failed` was the only thing separating them.
+        **A pinned control cannot move**, so a rate row against `last_u` demands
+        |0 - 1| = 1.0 against a limit of 0.34 and empties the feasible set. This
+        failed 846 of 864 solves in the first banded run, silently: each failure
+        fell back to the dispatch layer's own request, so the run completed and
+        reported results bit-identical to the layer below it.
         """
         movable = (u_hi - u_lo) > 1e-9
         offset = 0
@@ -593,28 +497,25 @@ class InnerNMPC:
         (``"gas.n_h2"``) and value the terminal state -- they are what carries
         the planner's long view into a one-hour problem.
 
-        `bands` is the newer interface: one `Band` per subsystem, carrying a
-        commitment and a setpoint ceiling. It supersedes `enables`, which passed
-        only the commitment. When both are given the band wins.
+        `bands` carries one `Band` per subsystem, with a commitment and a
+        setpoint ceiling. It supersedes `enables`, which passed only the
+        commitment; when both are given, the band wins.
         """
         filtering = self.objective == "filter"
         if filtering and reference_u is None:
             raise ValueError(
-                "filter mode needs `reference_u`: the complete action the "
-                "dispatch layer proposes, which is the thing being minimally "
-                "edited. Without it there is nothing to stay close to and the "
-                "filter degenerates into an unconstrained feasibility problem."
+                "filter mode needs `reference_u`: the action the dispatch layer "
+                "proposes, which is what is being minimally edited. Without it "
+                "the filter degenerates into a feasibility problem."
             )
         if not filtering and (
                 not targets or (self.objective == "economic" and not terminal_prices)):
             raise ValueError(
                 "InnerNMPC needs terminal inventory targets (and, in economic "
-                "mode, their prices). Nothing in a one-hour horizon rewards "
-                "making hydrogen or carbonate -- the methane they become is "
-                "hours away -- so without a terminal term the process setpoints "
-                "sit on a flat manifold, the solve does not converge, and any "
-                "answer it does return is arbitrary. The layer above supplies "
-                "these."
+                "mode, their prices). Nothing in a short horizon rewards making "
+                "hydrogen or carbonate, so without a terminal term the process "
+                "setpoints sit on a flat manifold and the solve does not "
+                "converge. The layer above supplies these."
             )
 
         n = self.n_steps
@@ -629,16 +530,12 @@ class InnerNMPC:
         lo = np.minimum(self._x_lo, x0)
         hi = np.maximum(self._x_hi, x0)
 
-        # Commitment is fixed, not optimised. The plant gates every subsystem
-        # with `smooth_step(e - 0.5, width=0.05)`, which is a near-discontinuity:
-        # as a free variable the enable has essentially zero gradient anywhere
-        # except within +/-0.1 of the switching point, so the solver has nothing
-        # to move it with and burns its whole budget. More to the point, this is
-        # not the NMPC's decision -- the commitment schedule is one of the three
-        # things the planner publishes, and the inner layer's job is continuous
-        # modulation at the price it is given. Pinning the enables here removes
-        # four near-discontinuous gates per interval *and* puts the decision in
-        # the layer that has the horizon to make it.
+        # Commitment is fixed, not optimised. The plant gates each subsystem
+        # with `smooth_step(e - 0.5, width=0.05)`: as a free variable the enable
+        # has essentially zero gradient outside +/-0.1 of the switching point,
+        # so the solver burns its budget on it. And it is not the inner layer's
+        # decision -- commitment is published by the layer with the horizon to
+        # make it. Pinning removes four near-discontinuous gates per interval.
         if bands:
             u_lo, u_hi, u_guess, ceilings = self._bind_bands(bands)
         else:
@@ -651,21 +548,17 @@ class InnerNMPC:
         b = NLPBuilder("nmpc")
 
         # In filter mode the state box is relaxed into the objective. A hard box
-        # on top of hard dynamics and a hard initial state is infeasible whenever
-        # the current state plus the model implies a bound crossing that no
-        # admissible control can prevent -- a flat battery at night against a
-        # hard SoC floor, with committed machines drawing mandatory idle load.
-        # That is exactly when a safety filter is most needed, so it is exactly
-        # when it must not fail.
+        # on top of hard dynamics and a hard initial state is infeasible
+        # whenever the state and the model imply a crossing no admissible
+        # control can prevent -- a flat battery at night against a hard SoC
+        # floor, with committed machines drawing mandatory idle load. That is
+        # exactly when a safety filter must not fail.
         #
         # The *variable* bound is widened by a margin rather than removed, to
-        # keep the NLP bounded; the true bounds are re-imposed below as
-        # penalised rows.
-        # Cumulative counters (methane made, water consumed, equivalent full
-        # cycles) have no upper bound at all, so `hi` is +inf for them. Those
-        # columns get no soft row -- a row against an infinite bound evaluates
-        # to Inf and the solve dies with `Invalid_Number_Detected` before it
-        # takes a single iteration.
+        # keep the NLP bounded; the true bounds return below as penalised rows.
+        # Cumulative counters have no upper bound, so they get no soft row -- a
+        # row against an infinite bound evaluates to Inf and the solve dies with
+        # `Invalid_Number_Detected` before its first iteration.
         soft_lo = np.isfinite(lo)
         soft_hi = np.isfinite(hi)
         if filtering and self.filter_trim_slacks:
@@ -684,11 +577,8 @@ class InnerNMPC:
             x0=np.tile(x0 / xs, n + 1),
         )
         # Predicted load shed, per interval, in units of the power scale.
-        #
         # **A slack with a finite upper bound does not soften a constraint** --
-        # it relocates the infeasibility. The tracking formulation capped these
-        # at 10 and 1 respectively, which is why `Infeasible_Problem_Detected`
-        # survived the soft-constraint work. In filter mode they are unbounded.
+        # it relocates the infeasibility. Unbounded in filter mode.
         slack_ub = np.inf if filtering else 10.0
         shed = b.variable("shed", n, lb=SLACK_FLOOR, ub=slack_ub,
                           x0=SLACK_FLOOR)
@@ -706,24 +596,13 @@ class InnerNMPC:
                           ub=np.inf, x0=SLACK_FLOOR)
                if filtering and movable else None)
 
-        # The rate-limit reference is where the actuator *actually is*, and it is
-        # deliberately not projected into the current band.
-        #
-        # When a band narrows -- a ceiling dropping from 0.9 to 0.2 -- the old
-        # control sits outside the new box, and a hard ceiling plus
-        # `|u_0 - last_u| <= 0.34` has no feasible point: 115 of 216 solves
-        # returned Infeasible_Problem_Detected this way.
-        #
-        # Projecting the reference to 0.2 removes the infeasibility by deleting
-        # the constraint that caused it, and is wrong. The plant models no
-        # actuator slew at all, so this rate limit *is* the only representation
-        # of a valve that cannot jump; pretending the actuator was already at the
-        # new ceiling licenses exactly the single-step jump the limit exists to
-        # forbid. The physically correct trajectory is a ramp -- 0.56, 0.22, 0.20
-        # -- which spends two intervals outside the band.
-        #
-        # So the band ceiling is soft instead (see `slack` below). The reference
-        # stays where the actuator is.
+        # The rate-limit reference is where the actuator *actually is*, and is
+        # deliberately not projected into the current band. Projecting it would
+        # remove the infeasibility by deleting the constraint that caused it:
+        # this rate limit is the only representation of a valve that cannot
+        # jump, so pretending the actuator already sat at the new ceiling
+        # licenses the single-step jump it exists to forbid. The band ceiling is
+        # soft instead.
         reference = None if last_u is None else np.asarray(last_u, dtype=float)
         uv = b.variable(
             "u", n * self._n_u,
@@ -748,67 +627,46 @@ class InnerNMPC:
 
             # --- bus balance, with the shed the real bus can perform.
             #
-            # `bus_total` is the sum of every power channel, so a positive value
-            # is a deficit -- and a deficit is something the DC bus resolves by
-            # shedding load. Modelling the balance as a hard equality therefore
-            # made the NMPC *more rigid than the plant it controls*: wherever the
-            # plant would simply shed, the NMPC had no feasible point at all.
+            # `bus_total` sums every power channel, so a positive value is a
+            # deficit, which the real DC bus resolves by shedding load. As a
+            # hard equality this made the NMPC *more rigid than the plant it
+            # controls*: where the plant would shed, the NMPC had no feasible
+            # point (35 % of solves, measured).
             #
-            # With commitment pinned by the dispatch layer the idle loads are
-            # mandatory, so this bites exactly where it hurts -- a nearly flat
-            # battery at night against a hard SoC floor. Measured: 35 % of solves
-            # infeasible even after the rate-limit fix.
-            #
-            # The slack is non-negative (you cannot shed a surplus; curtailment
-            # handles that) and priced far above any real energy value, so the
-            # solver will exhaust every alternative first. Its real worth is as a
-            # diagnostic: a positive shed is the inner layer predicting that the
-            # dispatch layer has committed more load than the bus can carry.
+            # The slack is non-negative -- you cannot shed a surplus,
+            # curtailment handles that -- and priced far above any real energy
+            # value. A positive shed is the inner layer predicting that the
+            # dispatch layer committed more load than the bus can carry.
             balances.append(step["bus_total"] / self._p_scale - shed[k])
 
             # --- the local economic objective
             r_sab = step["r_ch4"]
             price = float(prices[min(k, len(prices) - 1)])
 
-            # Battery wear is not optional here. Without it nothing in the
-            # objective depends on battery throughput, so charging and
-            # discharging at once is free, and the solver duly did exactly that
-            # (635 kW in, 500 kW out, 58 kW of pure round-trip loss). The wear
-            # term is what makes simultaneous charge/discharge strictly worse
-            # than either alone, which is how this formulation avoids needing an
-            # explicit complementarity constraint between them.
+            # Battery wear is not optional. Without it nothing in the objective
+            # depends on throughput, so simultaneous charge and discharge is
+            # free and the solver takes it (635 kW in, 500 kW out, 58 kW of pure
+            # loss). The wear term makes it strictly worse than either alone,
+            # which is how this avoids an explicit complementarity constraint.
             i_c = self._u_index("battery", 0)
             charge, discharge = U[k][i_c], U[k][i_c + 1]
             efc = (charge + discharge) * dt / (2.0 * self._battery.nominal_energy_J)
 
-            # No price on energy in the stage cost at all. Every intertemporal
-            # value lives in the terminal term, which is the only place it can
-            # be stated once.
-            #
-            # Two formulations were tried and both were wrong, in instructive
-            # ways. Pricing total *process* power -- the written formulation --
-            # double-counts against the enforced bus balance: substitute the
-            # balance and it becomes a charge of lambda on every watt of PV
-            # delivered, including watts that would otherwise be spilled, which
-            # is a standing bias toward curtailment. Moving lambda onto the
-            # battery instead fixes that but breaks something subtler: lambda is
-            # the *marginal* value of energy, and it is zero at midday precisely
-            # because the plant is already saturated and spilling. Pricing
-            # storage at the current lambda therefore says charging is worthless
-            # at noon -- exactly when the battery should be filling for the
-            # evening. Storage is worth the price at the hour it will be *used*,
-            # which a one-hour horizon cannot see and the terminal value can.
+            # No price on energy in the stage cost. Every intertemporal value
+            # lives in the terminal term. Pricing process power double-counts
+            # against the bus balance -- substitute the balance and it becomes a
+            # charge of lambda on every watt of PV delivered, a standing bias
+            # toward curtailment. Pricing the battery instead fails differently:
+            # lambda is the *marginal* value of energy and is zero at midday
+            # precisely because the plant is saturated, so it would say charging
+            # is worthless at noon. Storage is worth the price at the hour it is
+            # used, which only the terminal value can see.
             if filtering:
-                # Nothing per-stage. A filter's objective is the size of the
-                # edit to u_0, not the quality of the trajectory: steps 1..N-1
-                # exist only to certify that a feasible continuation exists.
-                # Anything summed over the horizon here would make this a
-                # tracking controller again.
+                # Nothing per-stage: a filter's objective is the size of the
+                # edit to u_0, and steps 1..N-1 exist only to certify that a
+                # feasible continuation exists.
                 pass
             elif self.objective == "tracking":
-                # No euros. The dispatch LP already decided what to run and how
-                # hard; this layer's only job is to realise that on dynamics the
-                # LP could not see, and to say so when it cannot.
                 profit = profit - self.setpoint_weight * self._setpoint_deviation(
                     uv[k * self._n_u:(k + 1) * self._n_u], track)
             else:
@@ -816,9 +674,8 @@ class InnerNMPC:
                     self.economics.p.methane_price_per_kg * r_sab * M_CH4
                 ) - efc * self._battery.cost_per_efc_EUR()
 
-            # --- rate limits. Real actuators move at a finite speed, and an
-            # unconstrained NMPC will happily chatter a kiln between 0 and 1 on
-            # a five-minute grid because the model lets it.
+            # --- rate limits. Real actuators move at finite speed; without
+            # this the NMPC chatters a kiln between 0 and 1 on a 5 min grid.
             prev = ca.DM(reference) if k == 0 and reference is not None \
                 else (U[k - 1] if k > 0 else None)
             if prev is not None and len(movable):
@@ -865,10 +722,9 @@ class InnerNMPC:
                                 else float(lo_s[i]) - blk[i] - s)   # <= 0
             b.constraint("state_box", ca.vertcat(*rows), lb=-1e6, ub=0.0)
 
-        # Band excursions are penalised well above setpoint tracking but well
-        # below a shed: exceeding the plan's ceiling for an interval while the
-        # actuator ramps is undesirable, and is not in the same class as failing
-        # to supply the bus.
+        # Well above setpoint deviation, well below a shed: overshooting the
+        # plan's ceiling while the actuator ramps is not in the same class as
+        # failing to supply the bus.
         if capped and not filtering:
             profit = profit - self.band_weight * ca.sum1(over)
 
@@ -879,16 +735,14 @@ class InnerNMPC:
             #   min  ||u_0 - u_plan||^2_W  +  rho . (violations)  +  eps . (tail)
             #
             # The edit term is O(1): controls are scaled to their own bounds, so
-            # a full-span edit on one column costs 1. That is what makes the
+            # a full-span edit on one column costs 1, which is what makes the
             # exact-penalty weights absolute rather than relative.
             ref = np.asarray(reference_u, dtype=float) / us
             d0 = uv[0:self._n_u] - ca.DM(ref)
             edit = ca.dot(d0, d0)
 
-            # Tail regularisation. Not tracking -- it has no reference at all,
-            # it only discourages the tail from chattering, which would leave
-            # u_0 sitting at the end of a trajectory the solver never had to
-            # make smooth. Small enough that it cannot shape u_0.
+            # Tail regularisation: no reference, it only stops the tail
+            # chattering, and is small enough that it cannot shape u_0.
             tail = 0.0
             for k in range(1, n):
                 dk = uv[k * self._n_u:(k + 1) * self._n_u] \
@@ -904,38 +758,28 @@ class InnerNMPC:
                 penalty = penalty + self.filter_rho_band * ca.sum1(over)
             profit = -(edit + penalty + self.filter_epsilon * tail)
         elif self.objective == "tracking":
-            # Dimensionless, and far above anything tracking or the terminal term
-            # can offer, so a shed is never traded for a better-followed plan.
+            # Far above anything else on offer, so a shed is never traded for a
+            # better-followed plan.
             profit = profit - self.shed_weight * ca.sum1(shed)
         else:
             # Priced per kWh actually shed, so the penalty scales with the
-            # interval length rather than being an arbitrary per-row constant.
+            # interval length rather than being a per-row constant.
             profit = profit - self.shed_penalty_EUR_per_kWh * shed_kWh * ca.sum1(shed)
 
-        # No terminal term in filter mode. A terminal inventory penalty is an
-        # economic objective, and at the tracking weights it outweighed setpoint
-        # following a hundredfold -- a second optimiser on a one-hour horizon,
-        # overriding the 240-hour layer that had far better information. A
-        # filter that penalises only u_0 has no incentive to drain a buffer,
-        # because it is not optimising the tail at all.
+        # No terminal term in filter mode: a terminal inventory penalty is an
+        # economic objective, i.e. a second optimiser on a five-minute horizon
+        # overriding the layer that has the long view. A filter that penalises
+        # only u_0 has no incentive to drain a buffer.
         b.maximise(profit if filtering else
                    profit + self._terminal_value(X[n], names, targets,
                                                  terminal_prices))
         nlp = b.build()
 
-        # Project the stored trajectory into the *current* box before reusing it.
-        #
-        # The variable count does not change when a band moves, so the stored
-        # solution always looks reusable -- but a band that has narrowed leaves
-        # it sitting outside the new bounds, and IPOPT then spends its early
-        # iterations pushing an infeasible point back onto the feasible set
-        # rather than optimising. Band changes are rare while the plant is idle
-        # and constant once it is cycling, which is exactly the pattern seen in
-        # the solve times: under a second early in a run, several seconds once
-        # every machine is committed.
-        # How many intervals each variable block spans, so the warm start can
-        # advance all of them together. Built here because this is where the
-        # block sizes are known.
+        # Warm start, with the block sizes (in intervals) the shift needs. The
+        # stored solution always *looks* reusable because the variable count
+        # does not change when a band moves, but a narrowed band leaves it
+        # outside the new bounds and IPOPT then spends its early iterations
+        # pushing an infeasible point back onto the feasible set.
         warm = self._warm_start(nlp, {
             "x": n + 1, "state_slack": n + 1,
             "u": n, "shed": n, "band_over": n, "rate_slack": n,
@@ -990,38 +834,20 @@ class InnerNMPC:
     def _warm_start(self, nlp, steps: Mapping[str, int]) -> np.ndarray | None:
         """The previous solution, advanced one interval, in this problem's layout.
 
-        Two defects in the version this replaces, and the docstring at the top of
-        this module described the fixed behaviour rather than the actual one --
-        it claimed the solve was "warm-started from the previous solve shifted by
-        one step, which is the standard MPC trick and is worth an order of
-        magnitude here". Nothing shifted anything.
+        The standard receding-horizon shift: the old `x_1..x_N` become the new
+        `x_0..x_{N-1}`, with the last entry repeated. Two details matter.
 
-        **It was not shifted.** The stored vector was reused as-is, so at the
-        next interval every entry was one step stale: the guess for `x_0` was the
-        old `x_0`, a full interval behind the state actually measured. On a ramp
-        that is a worse starting point than it looks, and it showed -- 127 mean
-        iterations where a warm-started receding-horizon NMPC converges in tens.
+        **Stored per block, not as one vector.** The total size moves with
+        commitment, because `band_over` and `rate_slack` are sized by how many
+        machines are committed and movable, so a single-vector guard discards
+        the warm start at exactly the transitions where it is worth most. Per
+        block, a changed slack count costs only that block.
 
-        **It was discarded whenever the size changed.** The guard was
-        `self._warm.size == nlp.n_x`, and the size moves with commitment, because
-        `band_over` and `rate_slack` are sized by how many machines are committed
-        and movable. So the warm start vanished at exactly the transitions where
-        a good guess is worth most. Storing per *block* instead means a changed
-        slack count costs only that block, and the states and controls -- the
-        expensive part to get right -- carry over regardless.
-
-        The shift itself is the standard one: with the horizon advanced by one
-        interval, the old `x_1..x_N` become the new `x_0..x_{N-1}`, and the last
-        entry is repeated because nothing is known about it yet.
-
-        **Every block is shifted, not just the states and controls.** A first
-        version advanced `x` and `u` and left the slacks alone, which measured
-        44 % *slower* than not shifting at all: the slacks are per-interval too,
-        so the result was a warm start whose interval-k slack belonged to the
-        constraint at interval k-1. A uniformly stale guess is self-consistent;
-        a half-shifted one is not, and IPOPT spent its early iterations undoing
-        the mismatch. `steps` carries how many intervals each block spans, since
-        that is what `solve` knows and this method cannot infer safely.
+        **Every block is shifted**, slacks included. Shifting only `x` and `u`
+        measured 44 % *slower* than not shifting at all: a warm start whose
+        interval-k slack belongs to the constraint at k-1 is not self-consistent
+        and IPOPT spends its early iterations undoing the mismatch. `steps`
+        carries how many intervals each block spans.
         """
         if not self._warm:
             return None
@@ -1042,27 +868,22 @@ class InnerNMPC:
                      movable, x0, weather, u_lo, ceilings):
         """Why did the filter move the plan, and what was pressing on it?
 
-        Two independent signals, because they answer the question differently
-        and disagreeing would itself be informative.
+        Two independent signals, so a disagreement between them is itself
+        informative.
 
         **Duals.** At the optimum `grad f = 2 (u_0 - u_plan)` is balanced by
         `sum_i lam_i grad g_i`, so the multipliers say which constraints
         produced the edit and in what proportion. Reported as dual mass,
         `sum |lam|`, per inequality block, with the state box broken down per
         state and side -- "the SoC floor" is a usable answer where "block
-        state_box" is not.
+        state_box" is not. `dynamics` and `initial_state` are excluded: their
+        multipliers are adjoints propagating a constraint's effect rather than
+        the constraint that caused it, and are always large.
 
-        `dynamics` and `initial_state` are deliberately excluded. Their
-        multipliers are never zero: they are adjoint variables propagating the
-        effect of a constraint, not the constraint that caused it, and
-        including them would swamp the attribution with something that is
-        always large and never informative.
-
-        **Counterfactual.** What the plan's own action would have violated, had
-        it been applied unchanged -- obtained by rolling `u_plan` forward
-        through the same nonlinear model with a zero-order hold. This is the
-        legible half: "the plan would have taken SoC below its floor" reads as
-        an explanation in a way that a multiplier does not.
+        **Counterfactual.** What the plan's own action would have violated had
+        it been applied unchanged, from rolling `u_plan` forward through the
+        same nonlinear model. The legible half: "the plan would have taken SoC
+        below its floor" explains in a way a multiplier does not.
         """
         out_edit = 0.0
         if reference_u is not None:
@@ -1102,12 +923,10 @@ class InnerNMPC:
             try:
                 for k in range(n):
                     w = weather[min(k, len(weather) - 1)]
-                    # The bus first, on the state the plan would actually be in.
-                    # This is the constraint the plan usually breaks -- its own
-                    # balance is an hourly average over a seven-state reduced
-                    # model, and this one is instantaneous on all sixteen -- so
-                    # a counterfactual that checked only state boxes came back
-                    # empty while the duals pointed squarely at the bus.
+                    # The bus first, on the state the plan would be in. This is
+                    # the constraint the plan usually breaks: its own balance is
+                    # an hourly average over seven states, this one is
+                    # instantaneous over sixteen.
                     step = self._step_fn(x=x, u=np.concatenate(
                         [u_map[key] for key in self._input_keys]),
                         w=self._weather_vector(w))
@@ -1130,40 +949,20 @@ class InnerNMPC:
         """Penalise leaving the inventories away from where the plan wants them.
 
         Without a terminal term the NMPC empties every buffer inside its own
-        hour, which is locally optimal and globally wrong -- exactly the failure
-        the hierarchy exists to prevent.
+        horizon, which is locally optimal and globally wrong.
 
-        Quadratic in the deviation, not linear in the level. That is a deliberate
-        change from the written formulation, and it was forced by measurement.
-        A linear terminal value `pi * (x_N - x_target)` is only correct if `pi`
-        is a true constant marginal value, and it is not: the worth of another
-        kilowatt-hour in the battery falls as the battery fills, because there is
-        less and less chance of using it. Priced linearly at the full
-        methane-chain value it comes to roughly 50-80 EUR across the pack against
-        stage costs of about 5 EUR, so the objective became "charge as hard as
-        possible" by a factor of fifteen, the solution sat in a corner, and the
-        NMPC stopped converging at all.
+        Quadratic in the deviation, not linear in the level. A linear terminal
+        value `pi * (x_N - x_target)` needs `pi` to be a constant marginal
+        value, and it is not -- another kilowatt-hour in the battery is worth
+        less as the battery fills. Priced linearly at the full methane-chain
+        value that is 50-80 EUR across the pack against stage costs of ~5 EUR,
+        so the objective became "charge as hard as possible", the solution sat
+        in a corner and the NMPC stopped converging. The quadratic form is
+        cheap near the target, expensive far from it, and bounded everywhere.
 
-        Three variants were tried and all failed the same way -- pricing process
-        power against the enforced balance, pricing the battery at the current
-        lambda, and pricing it at a forward lambda. They differ only in which
-        large linear coefficient they use. The original converged solely because
-        a `lambda * P_process` term happened to push back against the storage
-        incentive, which is two errors cancelling rather than a formulation.
-
-        The quadratic form is standard economic-MPC practice: cheap near the
-        target, expensive far from it, bounded gradient everywhere, and it
-        respects the fact that the planner chose that target for a reason. The
-        inner layer stays free to deviate where local conditions justify it,
-        which is the whole point of not tracking a setpoint trajectory.
-
-        In **tracking** mode there are no prices at all. The deviation is
-        normalised by the state's own characteristic magnitude and weighted by a
-        dimensionless `terminal_weight`, so ending the horizon 10 % away from the
-        planned inventory costs `0.01 * terminal_weight` against a fully
-        saturated setpoint's `setpoint_weight`. What a banked mole is *worth*
-        was settled by the dispatch LP; this layer only needs to know where the
-        plan expects the buffers to be.
+        In **tracking** mode there are no prices: the deviation is normalised
+        by the state scale and weighted dimensionlessly, since what a banked
+        mole is worth was already settled by the dispatch LP.
         """
         if not targets:
             return 0.0

@@ -1,14 +1,11 @@
 """Optimisation backends.
 
-Everything in this project that solves an NLP goes through `SolverBackend`. The
-planner and the NMPC build problems with `NLPBuilder`, hand them to whichever
-backend is configured, and read the answer back by name. Nothing upstream of
-this package imports CasADi's solver interface directly.
+Everything that solves an NLP goes through `SolverBackend`: problems are built
+with `NLPBuilder`, handed to whichever backend is configured, and read back by
+name. Nothing upstream imports CasADi's solver interface directly, so swapping
+in another solver is a configuration change rather than a rewrite.
 
-That indentation exists for one reason: at M7 a custom NLP solver replaces IPOPT
-inside the inner NMPC, and the swap has to be a configuration change rather than
-a rewrite. Building the interface first -- before the planner that will be its
-first user -- is what keeps that promise cheap.
+The outer dispatch MILP is a different animal and goes through `solvers.lp`.
 """
 
 from sfp.solvers.backend import (

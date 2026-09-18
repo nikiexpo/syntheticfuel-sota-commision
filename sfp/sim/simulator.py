@@ -1,18 +1,17 @@
 """The closed-loop simulation harness.
 
 One loop, one set of physics, swappable controllers. Everything that
-distinguishes a run -- the strategy, the weather, the injected fault -- is an
-argument; the harness itself never changes. That is what makes the baseline
-comparison in the report an honest one.
+distinguishes a run -- the strategy, the weather, the site -- is an argument;
+the harness never changes, which is what makes the baseline comparison honest.
 
 Two clocks, deliberately different:
 
     dt_s                the plant integration step (default 60 s)
-    control_interval_s  how often the controller is allowed to act (default 300 s)
+    control_interval_s  how often the controller may act (default 300 s)
 
 Real supervisory control does not run at the plant's timescale, and pretending
-it does hides exactly the lag that makes intermittency hard. Between controller
-calls the last setpoint is held, and the bus keeps the plant feasible.
+it does hides the lag that makes intermittency hard. Between controller calls
+the last setpoint is held and the bus keeps the plant feasible.
 """
 
 from __future__ import annotations
@@ -106,14 +105,13 @@ def simulate(
 ) -> SimulationResult:
     """Run one closed-loop simulation and return the full log.
 
-    `fault_schedule` is accepted now and honoured from M2; passing one before
-    then raises, rather than silently ignoring it and producing a fault-free
-    result that looks like a fault response.
+    `fault_schedule` is reserved. Passing one raises rather than silently
+    returning a fault-free result that looks like a fault response.
     """
     if fault_schedule is not None:
         raise NotImplementedError(
-            "fault injection lands in milestone M2; refusing to run and report a "
-            "fault-free result as if a fault had been injected"
+            "fault injection is not implemented; refusing to report a fault-free "
+            "result as if a fault had been injected"
         )
 
     config = config or SimulationConfig()
@@ -132,10 +130,9 @@ def simulate(
         horizon_s=config.duration_s,
         forecast=forecast,
         economics=economics,
-        # The truth is offered here for exactly one consumer: the perfect-
-        # foresight oracle, which is a bound rather than a controller. Any real
-        # strategy that reached for it would be cheating, and the plant/model
-        # split at M5 is what makes that distinction enforceable.
+        # The truth is here for exactly one consumer: the perfect-foresight
+        # oracle, which is a bound rather than a controller. Any real strategy
+        # that reached for it would be cheating.
         metadata={"weather_provenance": weather.provenance, "truth": weather},
     )
     controller.reset(context)
@@ -197,27 +194,19 @@ def simulate(
         # --- log ----------------------------------------------------------
         record = {"time_s": t}
         record.update(w)
-        # Reuse the evaluation the bus already performed at this exact state and
-        # dispatch rather than repeating the most expensive call in the loop.
-        # Those outputs come first because the dispatch, applied next, is
+        # Reuse the evaluation the bus already performed at this state and
+        # dispatch rather than repeating the loop's most expensive call. Its
+        # outputs come first because the dispatch, applied next, is
         # authoritative wherever the two overlap.
         record.update(dispatch.plant_outputs)
         record.update(dispatch.as_dict())
-        # The bus evaluates the plant *before* it knows how much PV will be
-        # curtailed, so it passes a curtail fraction of zero. Every PV-side
-        # quantity in `plant_outputs` is therefore provisional and must be
-        # replaced with the settled dispatch values.
+        # The bus evaluates the plant *before* it knows the curtailment or the
+        # battery dispatch, passing zero for both. Every PV- and battery-side
+        # quantity in `plant_outputs` is provisional and is replaced here with
+        # the settled values.
         record["pv_delivered_W"] = dispatch.pv_used_W
         record["pv_power_W"] = -dispatch.pv_used_W
         record["power.pv"] = -dispatch.pv_used_W
-        # The battery needs the same correction and for the same reason, and it
-        # is easier to miss: `power.pv` collides with a settled value so the
-        # omission is obvious, whereas the bus publishes `power.battery` and the
-        # dispatch publishes `battery_charge_W`/`battery_discharge_W` under
-        # different names, so nothing overwrote it. The bus evaluates the plant
-        # with no battery dispatch, which means **`power.battery` was
-        # identically zero in every log ever written** -- silently, since a
-        # plotted zero looks like an idle pack rather than a missing column.
         record["power.battery"] = (dispatch.battery_charge_W
                                    - dispatch.battery_discharge_W)
         record.update({f"state.{n}": v for n, v in zip(plant.state_names(), x)})

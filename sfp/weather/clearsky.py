@@ -8,11 +8,10 @@ Standard, citable models -- nothing invented here:
     clear-sky           Ineichen & Perez (2002) simplified model, Linke turbidity
     transposition       Liu & Jordan (1960) isotropic sky
 
-These are the same formulations pvlib implements; we carry our own copy so the
-project has no heavyweight dependency and so the clear-sky baseline is available
-offline. The clear-sky curve matters twice over: it sets PV output, and it is the
-denominator of the clear-sky index k = GHI / GHI_clear that the stochastic solar
-model and the PV-soiling fault detector are both built on.
+These are the same formulations pvlib implements; carried here so the project
+has no heavyweight dependency and the clear-sky baseline works offline. The
+curve matters twice over: it sets PV output, and it is the denominator of the
+clear-sky index k = GHI / GHI_clear that the weather resampling is built on.
 
 All angles are radians internally; the public functions take and return degrees
 only where a caller would naturally think in degrees (tilt, azimuth, latitude).

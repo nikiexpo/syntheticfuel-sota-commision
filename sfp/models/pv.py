@@ -9,10 +9,8 @@ peak rating but the two things that make available power differ from nameplate:
     inverter clipping   with a DC/AC ratio > 1 the array clips at midday, which
                         is *free* energy to any load that can absorb DC directly
 
-Cell temperature uses the Faiman (2008) model rather than the older NOCT one,
-because it is wind-dependent and because PVGIS -- our irradiance source -- uses
-the same model. Consistency between the data source and the array model is worth
-more here than a marginally more detailed thermal network.
+Cell temperature uses Faiman (2008) rather than NOCT: it is wind-dependent, and
+it is the model PVGIS itself uses, so the array agrees with its data source.
 """
 
 from __future__ import annotations
@@ -31,9 +29,9 @@ class PVArray(Subsystem):
 
     The single input is a curtailment fraction in [0, 1]: 0 delivers everything
     available, 1 shuts the array down. Curtailment is not waste to be avoided at
-    all costs -- when the battery is full and every load is at its limit, the
-    array *must* be backed off, and the energy that goes with it is exactly the
-    "energy lost through curtailment" the brief asks us to report.
+    all costs -- with the battery full and every load at its limit the array
+    *must* be backed off -- and it is the "energy lost through curtailment" the
+    brief asks us to report.
     """
 
     name = "pv"

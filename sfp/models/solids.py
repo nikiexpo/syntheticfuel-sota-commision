@@ -3,33 +3,24 @@
     carbonation   CaO   + CO2 -> CaCO3      ambient, exothermic, fans only
     calcination   CaCO3 -> CaO + CO2        900 degC, endothermic, enormous
 
-The inventory sitting between those two reactions is captured CO2 held as a
-solid, and **holding it costs nothing** -- no pressure vessel, no self-discharge,
-no round-trip loss. Compare the battery (0.021 EUR/kWh of throughput just in
-wear) or the gas buffers (a pressure vessel per few hours of storage). This is
-why the plan treats the calcium loop, not the battery, as the buffer that decides
-whether the plant survives a cloudy week.
+The inventory between those two reactions is captured CO2 held as a solid, and
+**holding it costs nothing** -- no pressure vessel, no self-discharge, no
+round-trip loss, against the battery's 0.021 EUR/kWh of throughput wear. The
+calcium loop, not the battery, is the buffer that decides whether the plant
+survives a cloudy week.
 
 This subsystem owns the inventory and nothing else. The rates that move material
-through it are computed by the air contactor and the calciner and arrive as
-coupling signals, which is why `rhs` reads them out of `w` rather than from its
-own inputs -- see `sfp.sim.plant.Plant` for the two-phase evaluation that makes
-that work.
+through it come from the contactor and the calciner as coupling signals, so
+`rhs` reads them out of `w` rather than from its own inputs.
 
-Deactivation
-------------
 Sorbent capacity falls with cycle number (Grasa & Abanades 2006):
 
     X_N = 1 / (k*N + 1/(1 - X_r)) + X_r        X_r ~ 0.075,  k ~ 0.52
 
-X_0 = 1.0 falling to ~0.16 by cycle 20. The consequence for control is the whole
-point: **every calcination permanently destroys some of the plant's capture
-capacity**, so calcining is never free even when electricity is. A greedy
-controller calcines whenever the sun is out and wrecks its own sorbent; a
-planning controller will not.
-
-To keep that differentiable inside an NLP, the cycle counter is a *continuous*
-state advanced by calcination throughput rather than an integer event count:
+X_0 = 1.0 falling to ~0.16 by cycle 20, so **every calcination permanently
+destroys some capture capacity** and calcining is never free even when
+electricity is. To keep that differentiable, the cycle counter is a
+*continuous* state advanced by calcination throughput:
 
     dN/dt = r_calcination / n_total
 """

@@ -1,8 +1,8 @@
-"""The economic dispatch layer (proposed L2) -- a linear program.
+"""The economic dispatch layer (L2) -- a mixed-integer linear program.
 
-Replaces `EconomicPlanner`'s nonlinear program with unit commitment over storage.
+Unit commitment over storage, in place of `EconomicPlanner`'s nonlinear program.
 It decides *all* the economics and none of the dynamics; the inner NMPC does the
-reverse. See `bookkeeping/07_PROPOSED_ARCHITECTURE.tex` for the argument.
+reverse.
 
 What it publishes downward is a **dispatch band** per machine per interval:
 
@@ -189,33 +189,24 @@ class EconomicDispatch(Controller):
         horizon_hours: int = 240,
         replan_interval_s: float = 3 * 3600.0,
         terminal_value_fraction: float = 0.5,
-        #: Commitment stays relaxed to [0,1] in this stage. The integrality gap
-        #: measured on the prototype is ~15 %, so this is a real approximation
-        #: and not a free one -- but a MILP at this horizon does not solve, and
-        #: the rounding is what the inner layer's band then works within.
+        #: Where a relaxed commitment rounds to a committed machine.
         commit_threshold: float = 0.5,
         #: How far out the kiln's "hot enough to calcine" indicator is required
-        #: to be integral. Beyond this it is relaxed to [0,1].
+        #: to be integral; beyond this it is relaxed to [0,1].
         #:
-        #: The indicator has to be binary somewhere -- its relaxation leaks badly
-        #: enough to schedule calcination on a cold kiln (see `_build`) -- but it
-        #: only has to be binary where the schedule is *implemented*. The plan is
-        #: rebuilt every three hours and the far end exists to value terminal
-        #: inventory, so a mildly optimistic kiln out there barely moves today's
-        #: decision. Measured at 240 h: 24 binary hours solves in 12 s, 48 in
-        #: 28 s, 72 in 120 s (capped), while the objective moves 2818 -> 2813 ->
-        #: 2810, i.e. 0.3 %. The tail relaxation costs almost nothing and the
-        #: default is set where the curve turns. Only the first three hours are
-        #: ever implemented, so 24 is a wide margin over what is needed.
+        #: It has to be binary somewhere -- the relaxation leaks badly enough to
+        #: schedule calcination on a cold kiln (see `_build`) -- but only where
+        #: the schedule is *implemented*. Measured at 240 h: 24 binary hours
+        #: solves in 12 s, 48 in 28 s, 72 in 120 s (capped), while the objective
+        #: moves 2818 -> 2813 -> 2810, i.e. 0.3 %. Only the first three hours
+        #: are ever implemented, so 24 is a wide margin.
         binary_horizon_hours: int = 24,
         time_limit_s: float = 120.0,
         #: Recover lambda from the MILP. **Off by default: nothing reads it.**
-        #: The inner NMPC accepts `prices` and discards it in both objective
-        #: modes, and the proposed safety filter has no economics at all, so the
-        #: price survives only as a reported diagnostic. Recovering it costs a
-        #: second LP solve on every replan -- the integers fixed and the
-        #: continuous problem re-solved -- which is real time in a sweep that
-        #: never looks at the answer. Turn it on for a reporting run.
+        #: The filter has no economics, so the price survives only as a reported
+        #: diagnostic, and recovering it costs a second LP solve per replan
+        #: (integers fixed, continuous problem re-solved). Turn it on for a
+        #: reporting run.
         recover_duals: bool = False,
         name: str | None = None,
     ) -> None:
@@ -283,30 +274,24 @@ class EconomicDispatch(Controller):
     def _record_divergence(self, t: float, z0: np.ndarray) -> None:
         """How far the plant has drifted from the plan since the last replan.
 
-        This is the number that decides whether a plan may stand in for a
-        simulation. A sweep over battery sizes, methane prices and locations is
-        affordable on plans and not on closed-loop runs, but only if the plan is
-        a faithful predictor -- and "faithful" has to be measured, not asserted.
+        This is what decides whether a plan may stand in for a simulation. Two
+        errors, answering different questions:
 
-        Two errors are reported, and they answer different questions:
+        `plan_divergence_*`  where the buffers are against where the previous
+                             plan said they would be, normalised by capacity --
+                             physical drift of the linearised model.
 
-        `plan_divergence_*`  where the buffers actually are against where the
-                             previous plan said they would be, normalised by each
-                             buffer's own capacity. This is physical drift: the
-                             LP's linearised model against the real plant.
-
-        `plan_profit_error`  realised minus predicted operating profit over the
-                             window just elapsed. This is the one a sweep depends
-                             on. Physical drift can be large while the economics
-                             still land, and it can equally be small while a
-                             mis-timed commitment costs real money.
+        `plan_profit_window_EUR`  what the superseded plan expected to earn over
+                             the window just run, for comparison against what
+                             was realised. Drift can be large while the
+                             economics land, and small while a mis-timed
+                             commitment costs real money.
         """
-        # `self.plan` is still the plan that has been in force since its own t0 --
-        # it is overwritten further down this method. Holding a separate
-        # `_prev_plan` assigned at the *end* of a replan gives the plan from two
-        # replans ago, so the planned window spans two replan intervals while the
-        # realised one spans a single one. That halves every ratio and looks
-        # exactly like the model over-predicting by a factor of two.
+        # `self.plan` is still the plan in force since its own t0; it is
+        # overwritten further down. A separate `_prev_plan` assigned at the end
+        # of a replan would give the plan from two replans ago, spanning two
+        # replan intervals against one realised -- which halves every ratio and
+        # looks exactly like the model over-predicting by two.
         prev = self.plan
         if prev is None or len(prev.stage_profit_EUR) == 0:
             return
@@ -324,7 +309,6 @@ class EconomicDispatch(Controller):
         for name, e in zip(self.DIVERGENCE_STATES, err):
             self._diagnostics[f"plan_divergence_{name}"] = float(e)
         self._diagnostics["plan_divergence_rms"] = float(np.sqrt(np.mean(err ** 2)))
-        # what the superseded plan expected to earn over the window just run
         self._diagnostics["plan_profit_window_EUR"] = prev.profit_between(
             prev.t0_s, t)
         self._diagnostics["plan_window_s"] = float(t - prev.t0_s)
@@ -461,10 +445,9 @@ class EconomicDispatch(Controller):
                 [(L.z(k + 1, 5), 1.0), (L.z(k, 5), -1.0), (L.u(k, L.imw), -dt)]
                 + [(c, -2.0 * dt * recovery * v * M_H2O) for c, v in rate(k, "sabatier")]
                 + [(c, dt * v * M_H2O) for c, v in rate(k, "electrolyser")], 0.0)
-            # kiln energy balance -- exactly linear. The feed's sensible heat is
-            # evaluated at the operating temperature rather than at T_k, which
-            # is the one approximation here and is worth a few per cent of the
-            # heat duty during warm-up only.
+            # kiln energy balance -- exactly linear. The one approximation is the
+            # feed's sensible heat, evaluated at the operating temperature
+            # rather than at T_k: a few per cent of the duty, during warm-up.
             t_amb = float(rows["temp_air"][k]) + 273.15
             b.equality(
                 [(L.z(k + 1, 6), 1.0),
@@ -495,29 +478,23 @@ class EconomicDispatch(Controller):
                 for m, col in enumerate(L.seg(k, key)):
                     b.row([(col, 1.0), (L.e(k, key), -float(width[m]))], -np.inf, 0.0)
 
-        # --- the kiln's own band, and the reason it needs a temperature state.
+        # --- the kiln's band, and why it needs a temperature state.
         #
-        # Heater power sits between standby and rated when committed, zero when
-        # not. The rate is capped by the feeder's throughput and -- the important
-        # one -- by how hot the kiln actually is, since it takes 5.6 h at full
-        # heater to make calcination possible at all from cold.
+        # Heater power sits between standby and rated when committed. The rate
+        # is capped by the feeder and by how hot the kiln is -- from cold it
+        # takes 5.6 h at full heater before calcination is possible at all.
         #
-        # That second cap cannot be written directly. `r <= slope (T - onset)`
-        # rearranges to `T >= onset + r/slope`, which at `r = 0` demands a
-        # permanently hot kiln; and the set it is trying to describe,
-        # `0 <= r <= max(0, slope (T - onset))`, is genuinely non-convex. So it
-        # takes an indicator `y`, which is what a unit-commitment model's
-        # start-up state is for:
+        # That second cap cannot be written directly: `r <= slope (T - onset)`
+        # rearranges to `T >= onset + r/slope`, demanding a permanently hot kiln
+        # at `r = 0`, and the set it describes, `0 <= r <= max(0, slope
+        # (T - onset))`, is genuinely non-convex. Hence an indicator `y`:
         #
         #     r <= r_max * y                       nothing produced unless hot
         #     r <= slope (T - onset) + M (1 - y)   the cap, released when y = 0
         #     y <= e                               and only when energised
         #
-        # with `M = slope (onset - T_min)`, the smallest value that lets a cold
-        # kiln sit feasibly at `r = 0`. Relaxing `y` to [0,1] keeps this an LP.
-        # The relaxation is not loose: feasibility at `r = 0` forces
-        # `1 - y >= (onset - T)/(onset - T_min)`, so `y` is pinned to zero at
-        # ambient and only becomes free as the kiln approaches its onset.
+        # with `M = slope (onset - T_min)`, the smallest value letting a cold
+        # kiln sit feasibly at `r = 0`.
         big_m = kiln.slope_mol_s_K * (kiln.onset_K - 250.0)
         b.block("kiln_band")
         for k in range(n):
@@ -534,13 +511,11 @@ class EconomicDispatch(Controller):
             # Maximising the relaxation over y in [0,1] gives
             #     r* = r_max (slope (T - onset) + M) / (r_max + M),
             # which at 841 K permits 0.26 mol/s where the real kiln calcines
-            # nothing -- and the convex hull is no tighter, because the
-            # non-convexity is genuine. A relaxed indicator reproduces exactly
-            # the failure it was added to prevent: the layer schedules
-            # calcination on a cold kiln, the sorbent saturates, and production
-            # collapses to 17 kg/day.
-            #
-            # Only the near term needs it, though. See `binary_horizon_hours`.
+            # nothing, and the convex hull is no tighter because the
+            # non-convexity is genuine. Relaxed, the layer schedules calcination
+            # on a cold kiln, the sorbent saturates, and production collapses to
+            # 17 kg/day. Only the near term needs it -- see
+            # `binary_horizon_hours`.
             if k < self.binary_horizon_hours:
                 b.integer(L.u(k, L.ical_y))
 
@@ -549,14 +524,13 @@ class EconomicDispatch(Controller):
         # The plant throttles the Sabatier as either buffer runs down,
         #     availability = min( clip(co2_free/50), clip(h2_free/200) ),
         # and without an equivalent the LP assumes full conversion right up to
-        # the box floor. The reactor is the binding subsystem in every run, so
-        # this is the largest single reason the plan out-predicts the plant.
+        # the box floor. The reactor binds in every run, so this is the largest
+        # single reason the plan out-predicts the plant.
         #
-        # Unlike the kiln's rate cap this needs no indicator. The kiln's onset
-        # sits well above its temperature floor, which is what made that set
-        # non-convex; here the taper reaches zero exactly *at* the box floor, so
-        # `r_sab = 0` is feasible everywhere and the two rows are an honest
-        # linear envelope of the min().
+        # No indicator needed here: the taper reaches zero exactly *at* the box
+        # floor, so `r_sab = 0` is feasible everywhere and the two rows are an
+        # honest linear envelope of the min(). (The kiln's onset sits well above
+        # its temperature floor, which is what made that set non-convex.)
         b.block("reactor_availability")
         gas = model.gas.p
         co2_floor = float(gas.co2_min_fraction * gas.co2_capacity_mol)
@@ -577,16 +551,12 @@ class EconomicDispatch(Controller):
             b.row([(c, 1.0) for c in L.seg(k, "electrolyser")]
                   + [(L.e(k, "electrolyser"), -d_min)], 0.0, np.inf)
 
-        # A start is an *increase* in commitment, so interval 0 has to be
-        # measured against what is already running -- not against zero.
-        #
-        # Without that, `s_0 >= e_0` charges a fresh start-up for every machine
-        # that was already on, at every replan: EUR 80 every three hours for the
-        # kiln and reactor alone. The plan still looks sensible while the horizon
-        # is long enough to repay it, and then, as the horizon shortens toward
-        # the end of a run, the layer shuts the whole plant down to avoid a cost
-        # it should never have been charged. Measured before this fix: the
-        # reactor ran hours 8-11 and never restarted, 19.2 kg/day.
+        # A start is an *increase* in commitment, so interval 0 is measured
+        # against what is already running, not against zero. Otherwise
+        # `s_0 >= e_0` charges a fresh start-up for every running machine at
+        # every replan -- EUR 80 every three hours for the kiln and reactor
+        # alone -- and as the horizon shortens the layer shuts the plant down to
+        # avoid a cost it was never owed. Measured: 19.2 kg/day.
         b.block("start_counter")
         for k in range(n):
             for key in SUBSYSTEMS:
@@ -609,9 +579,9 @@ class EconomicDispatch(Controller):
         # ---- objective: minimise -(profit)
         price = econ.p.methane_price_per_kg
         c_batt = battery.cost_per_efc_EUR()
-        # Cost per *cycle* of the whole inventory, so it pairs with dN = r/n_tot.
-        # The solids model reports it per mole calcined, which is the same number
-        # divided by n_tot -- multiplying back keeps one definition in one place.
+        # Cost per *cycle* of the whole inventory, to pair with dN = r/n_tot.
+        # The solids model reports it per mole calcined; multiplying back by
+        # n_tot keeps one definition in one place.
         c_sorb = n_tot * float(model.solids.marginal_deactivation_cost_per_mol(
             np.array([0.0, float(z0[zi("n_caco3")]), float(z0[zi("cycle_number")])]),
             float(model.solids.p.sorbent_cost_per_mol)))
@@ -654,18 +624,12 @@ class EconomicDispatch(Controller):
                     setpoint = pwl[key].setpoint_for(d)
 
                 # Commit whenever the plan intends output, not only when the
-                # relaxed enable happens to clear 0.5.
-                #
-                # `delta <= width * e` ties dispatch to the enable, so the LP can
-                # settle at e = 0.45 with the machine genuinely working at 45 %
-                # of span. Rounding that enable *down* discards the dispatch with
-                # it. Measured on the contactor: twelve intervals planned at
-                # 38-42 % flow, every one of them shut off by the rounding, with
-                # the capture silently lost.
-                #
-                # Rounding up instead costs only the idle draw -- 2.4 kW planned
-                # against 2.6 kW committed for that contactor -- and keeps the
-                # production. The asymmetry is not close.
+                # relaxed enable clears 0.5. `delta <= width * e` ties dispatch
+                # to the enable, so the LP can settle at e = 0.45 with the
+                # machine genuinely working at 45 % of span, and rounding that
+                # down discards the dispatch with it (measured: twelve
+                # contactor intervals at 38-42 % flow, all silently lost).
+                # Rounding up costs only the idle draw.
                 committed = e >= self.commit_threshold or setpoint > 1e-4
                 row[key] = Band(committed=committed, setpoint_max=setpoint,
                                 dispatch=d)

@@ -1,50 +1,38 @@
-"""The planner's reduced model: six states that carry value across hours.
+"""The NLP planner's reduced model: seven states that carry value across hours.
 
-The full plant has sixteen states. The planner does not need them. Stack and
-reactor temperatures, catalyst activity and voltage degradation all settle within
-minutes against an hourly grid, so they are eliminated by assuming quasi-steady
-state and holding them at their regulated values. What is left is exactly the set
-of quantities that *store* something from one hour to the next:
+Used by `planner.EconomicPlanner` and the oracle built on it. The full plant has
+sixteen states; stack and reactor temperatures, catalyst activity and voltage
+degradation all settle within minutes against an hourly grid, so they are
+eliminated by holding them at their regulated values. What is left is the set of
+quantities that *store* something from one hour to the next:
 
-    z = (SoC, n_CaCO3, N, n_H2, n_CO2, T_kiln)
+    z = (SoC, n_CaCO3, N, n_H2, n_CO2, T_kiln, water)
 
-Each is a buffer. The battery stores electricity, the carbonate stores carbon
-cheaply, the two gas tanks store it expensively but usably, the kiln's refractory
-stores heat, and N is the running cost of having used the carbonate buffer at all.
-Scheduling this plant *is* co-scheduling those five things, which is why the
-planner's state vector is the list of them.
+Each is a buffer: the battery stores electricity, the carbonate stores carbon
+cheaply, the two gas tanks store it expensively but usably, the refractory
+stores heat, and N is the running cost of having used the carbonate at all.
+Scheduling this plant *is* co-scheduling them.
 
-Fidelity, and where it is deliberately given up
------------------------------------------------
-Rate expressions are taken from the real subsystem models wherever the reduced
-state supports them -- the Baker equilibrium, the Arrhenius kinetics, the
-Grasa-Abanades deactivation curve and the Butler-Volmer polarisation curve are
-the same equations the plant integrates, evaluated symbolically. `test_planner.py`
-pins the reduced model against the full one so the two cannot drift apart.
+Rate expressions come from the real subsystem models wherever the reduced state
+supports them -- Baker equilibrium, Arrhenius kinetics, the Grasa-Abanades
+deactivation curve and the Butler-Volmer polarisation curve are the same
+equations the plant integrates. `test_planner.py` pins the two together.
 
-Three things are approximated, and each is a deliberate trade:
+Two deliberate approximations:
 
 1. **Enables are relaxed to [0, 1].** The real subsystems gate on a sharp
-   `smooth_step` at 0.5, which is nearly a discontinuity and would wreck an NLP.
-   Here commitment is a continuous variable `e` with `s <= e` and, where a
-   minimum load exists, `s >= s_min * e`. That is the standard relaxation of a
-   unit-commitment binary, and it is rounded on the way down to the bus.
+   `smooth_step` at 0.5, which would wreck an NLP. Here commitment is continuous
+   with `s <= e` and, where a minimum load exists, `s >= s_min * e` -- the
+   standard unit-commitment relaxation, rounded on the way down to the bus.
 
 2. **The reactor runs at its regulated temperature or not at all.** With the
    temperature eliminated there is no relight transient, so the 31 kWh light-off
-   is charged explicitly as a start-up cost instead. The kiln needs no such term:
-   its temperature *is* a planner state, so the cost of a cold start emerges from
-   the energy balance rather than being priced in by hand.
+   is charged explicitly as a start-up cost. The kiln needs no such term: its
+   temperature *is* a state, so a cold start's cost emerges from the energy
+   balance.
 
-3. **The water tank is not a planner state.** Over a ten-day horizon at the
-   reference sizing the tank falls from 70 % to roughly 5 %, so it is close to
-   binding and this is a real omission rather than a safe one. It is recorded in
-   `bookkeeping/03_SIZING.md` and belongs in the planner as a seventh state if a
-   run is ever extended past ten days.
-
-The inner NMPC at M4 carries the full sixteen states, so these approximations are
-corrected at the layer that acts on them -- which is the entire argument for
-having two layers rather than one.
+The inner NMPC carries all sixteen states, so these approximations are corrected
+at the layer that acts on them -- the argument for having two layers.
 """
 
 from __future__ import annotations
@@ -59,13 +47,10 @@ from sfp.units import DH_CALCINATION, F_FARADAY, M_CACO3, M_CH4, M_H2O
 
 #: Order of the reduced state vector. Used everywhere; never index by number.
 #:
-#: `water_kg` is the seventh, added after the M3 review. It was flagged as a
-#: known omission when this model was first written and it is a real one: at the
-#: reference sizing the plant consumes about 312 kg/day net of condensate
-#: recovery, against 3250 kg usable in the tank, so the tank empties in around
-#: ten days. Over a seven-day horizon it does not bind, which is precisely why it
-#: has to be in the model -- a constraint that is nearly active is one the
-#: planner should be trading against, not one it should be blind to.
+#: `water_kg` is included because it nearly binds: at the reference sizing the
+#: plant consumes ~312 kg/day net of condensate recovery against 3250 kg usable,
+#: so the tank empties in about ten days. A constraint that is nearly active is
+#: one the planner should trade against rather than be blind to.
 STATE_NAMES: tuple[str, ...] = (
     "soc", "n_caco3", "cycle_number", "n_h2", "n_co2", "kiln_temperature_K",
     "water_kg",
@@ -73,21 +58,17 @@ STATE_NAMES: tuple[str, ...] = (
 
 #: Order of the reduced control vector.
 #:
-#: The two vent rates are not really controls -- no operator opens a relief valve
-#: on purpose -- but they must be decision variables, because without them the
-#: problem is *infeasible* rather than merely unattractive. The dynamics are
-#: equalities and the tank levels are box-bounded, so a plan in which the
-#: electrolyser fills the hydrogen tank has no solution at all unless the model
-#: can say where the surplus went. The real plant vents (`gas_h2_vented_mol_s`),
-#: so the planner must be able to as well. Venting is never attractive -- it
-#: throws away methane the objective wants -- so the optimiser avoids it on its
-#: own, and a plan that vents anyway is reporting something worth reading.
+#: The two vent rates are not really controls, but they must be decision
+#: variables or the problem is *infeasible* rather than merely unattractive: the
+#: dynamics are equalities and the tanks are box-bounded, so a plan that fills
+#: the hydrogen tank has no solution unless the model can say where the surplus
+#: went. The real plant vents, so the planner must be able to. Venting throws
+#: away methane the objective wants, so the optimiser avoids it unprompted and a
+#: plan that vents anyway is reporting something worth reading.
 #:
-#: `water_makeup_kg_s` is a real decision: water arrives by road at a remote arid
-#: site, so scheduling deliveries is something an operator does. Making it a
-#: control rather than a fixed parameter also removes the positive part from the
-#: cost -- the delivery *is* the positive part -- and gives the tank a recourse,
-#: so a long horizon cannot become infeasible simply by running dry.
+#: `water_makeup_kg_s` is a real decision -- water arrives by road -- and as a
+#: control it gives the tank a recourse, so a long horizon cannot become
+#: infeasible simply by running dry.
 CONTROL_NAMES: tuple[str, ...] = (
     "contactor_flow", "calciner_heat", "electrolyser_load", "sabatier_feed",
     "contactor_on", "calciner_on", "electrolyser_on", "sabatier_on",
@@ -136,12 +117,10 @@ class PlannerLimits:
 
 @dataclass
 class PlannerModel:
-    """Six-state reduced model, evaluated numerically or symbolically.
+    """Seven-state reduced model, evaluated numerically or symbolically.
 
-    Constructed from a `Plant`, so it can never be parameterised differently from
-    the plant the controller is attached to. (The *truth* simulator's parameters
-    are perturbed away from these at M5; that mismatch is the point, and it enters
-    through the plant the controller is given, not through this class.)
+    Constructed from a `Plant`, so it can never be parameterised differently
+    from the plant the controller is attached to.
     """
 
     plant: Any
@@ -302,11 +281,9 @@ class PlannerModel:
     # Guards deleted rather than smoothed
     # -----------------------------------
     # The plant's models clamp several quantities that a state box already makes
-    # unreachable. Deleting such a guard is strictly better than smoothing it:
-    # it is exact, it costs no variable and no row, and it removes a kink that
-    # would otherwise sit on the feasible set. Each deletion below names the box
-    # that makes it safe, because the argument is only valid while that box
-    # stands -- `test_deleted_guards_are_unreachable` re-checks them.
+    # unreachable. Deleting such a guard is exact, costs no variable and no row,
+    # and removes a kink from the feasible set. Each deletion names the box that
+    # makes it safe -- `test_deleted_guards_are_unreachable` re-checks them.
     #
     #   fmax(cycle_number, 0)      -> box  cycle_number >= N_0 >= 0
     #   fmax(capacity, 1.0)        -> X_N >= X_r = 0.075, so capacity >= 3750 mol
@@ -410,10 +387,9 @@ class PlannerModel:
         # heater setting. The heater acts only through the energy balance, which
         # is why kiln commitment is a genuinely dynamic decision.
         #
-        # Composed from the calciner's own three limits, without its outer
-        # `fmax(rate, 0)`: the three factors are individually non-negative, so
-        # the clamp is redundant, and its kink sits at exactly the operating
-        # point of a cold kiln.
+        # Composed from the calciner's three limits without its outer
+        # `fmax(rate, 0)`: each factor is non-negative, so the clamp is
+        # redundant and its kink sits exactly at a cold kiln's operating point.
         cal = self.calciner
         r_calc = (
             cal.p.calcination_rate_max_mol_s
@@ -437,20 +413,14 @@ class PlannerModel:
         sab = self.sabatier
         co2_free = z[_IZ["n_co2"]] - self.gas.p.co2_min_fraction * self.co2_capacity_mol
         h2_free = z[_IZ["n_h2"]] - self.gas.p.h2_min_fraction * self.h2_capacity_mol
-        # Two different widths, because the two operators fail in opposite ways.
-        #
-        # The *clips* get 1e-2 rather than the plant's 1e-3. Deleting the cushion
-        # guards helped the gradient but moved the sharpest curvature inward:
-        # what the guard used to smooth over ~1 mol, the clip now turns over in
-        # 0.05 mol of CO2 -- a near-discontinuity sitting on the tank's own lower
-        # box, which is exactly where a starved reactor operates.
-        #
-        # The *min* keeps 1e-3, because `smooth_min` is biased low by eps/2
-        # wherever its arguments are equal -- and they are equal, at exactly 1.0,
-        # whenever both buffers are comfortable, which is most of the time. At
-        # 1e-2 that is a systematic 0.5 % under-prediction of the reactor rate
-        # across the whole plan: small, invisible, and in the direction that
-        # would quietly make the planner pessimistic about its own product.
+        # Two widths, because the operators fail in opposite ways. The *clips*
+        # get 1e-2: deleting the cushion guards moved the sharpest curvature
+        # inward, so the clip turns over in 0.05 mol of CO2, a
+        # near-discontinuity sitting on the tank's own lower box. The *min*
+        # keeps 1e-3, because `smooth_min` is biased low by eps/2 wherever its
+        # arguments are equal -- which they are, at 1.0, whenever both buffers
+        # are comfortable, so 1e-2 would under-predict the reactor by 0.5 %
+        # across the whole plan.
         availability = mx.smooth_min(
             mx.smooth_clip(co2_free / 50.0, 0.0, 1.0, eps=1e-2),
             mx.smooth_clip(h2_free / 200.0, 0.0, 1.0, eps=1e-2),

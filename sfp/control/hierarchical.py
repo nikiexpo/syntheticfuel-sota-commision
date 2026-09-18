@@ -1,7 +1,8 @@
-"""The full hierarchical controller: planner over NMPC, coupled by a price.
+"""NLP planner over an economic NMPC, coupled by a price.
 
-This is the thing the project is actually about. Two optimisers on different
-clocks, and exactly one number passing between them:
+The price-coordinated hierarchy, superseded for the shipped controller by
+`DispatchNMPCController` and kept as a comparator. Two optimisers on different
+clocks, with one number passing between them:
 
     [L2] economic planner    3 days, graded grid, re-solved every 3 h
               |
@@ -16,24 +17,17 @@ clocks, and exactly one number passing between them:
     [L4] DC bus + interlocks
 
 The planner never sees a five-minute decision and the NMPC never sees a
-three-day horizon. That is the point: the multiscale problem is dissolved by the
-price rather than by forcing one optimiser to span both scales.
+three-day horizon: the multiscale problem is dissolved by the price rather than
+by forcing one optimiser to span both scales.
 
-What happens when a layer fails
--------------------------------
-Deliberate, and different for each.
+Failure paths, both counted and reported:
 
-**No plan yet, or the planner failed**: the NMPC runs on the last price it had.
-If there has never been one, the controller holds everything off rather than
-inventing a schedule -- a silent fallback here would look like a working
-controller and would quietly become the thing being measured.
+**No plan, or the planner failed**: the NMPC runs on the last price it had, and
+with no price ever, the controller holds everything off rather than inventing a
+schedule.
 
-**The NMPC failed**: fall back to the planner's own schedule for that interval.
-It is coarser and it is stale, but it is a feasible plan from a converged solve,
-which is a great deal better than the last setpoint held indefinitely.
-
-Both paths are counted and reported, because a controller that is silently
-running on its fallback is not the controller anyone thinks is being measured.
+**The NMPC failed**: fall back to the planner's own schedule for the interval --
+coarse and stale, but a feasible plan from a converged solve.
 """
 
 from __future__ import annotations

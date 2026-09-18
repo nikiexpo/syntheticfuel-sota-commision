@@ -1,25 +1,22 @@
-"""The economic planner (layer 2) -- the outer problem of the hierarchy.
+"""The NLP economic planner -- the original outer layer, kept as a comparator.
+
+Superseded for the shipped controller by `dispatch.EconomicDispatch`, which
+reaches a 240 h horizon in 0.34 s where this NLP fails above 72 h. It remains
+because the perfect-foresight oracle is built on it and because the two are
+worth comparing.
 
 Decides, over a three-day horizon on a graded time grid, how much energy goes
-into each chain and how much inventory to bank, re-solving every three hours on a
-receding horizon. It hands three things downward:
+into each chain and how much inventory to bank, re-solving every three hours. It
+hands three things downward:
 
     inventory targets      where the buffers should be at the next tick
     commitment schedule    which subsystems should be running
     lambda                 the shadow price of electricity, EUR/kWh
 
-The third is the important one, and it is the reason the hierarchy works. Lambda
-is the dual of the energy-balance constraint: the marginal value, in euro, of one
-more kilowatt-hour on the bus at that hour. Handed down, it lets the inner NMPC
-solve a *local* problem -- make methane, buy energy at lambda -- without ever
-seeing the planner's time grid or its ten-day horizon. That is Lagrangian
-decomposition rather than a heuristic hand-off, and it degrades gracefully: a
-stale plan still yields a sensible price, where a stale setpoint trajectory does
-not.
-
-At M3 the planner drives the plant directly, so the numbers it produces are
-visible immediately and its price signal can be sanity-checked against the
-physics before anything depends on it. The NMPC slots underneath at M4.
+Lambda is the dual of the energy-balance constraint -- the marginal value of one
+more kilowatt-hour on the bus at that hour -- which lets the inner NMPC solve a
+*local* problem without seeing the planner's grid or horizon. It degrades
+gracefully: a stale plan still yields a sensible price.
 
 Structure of the NLP
 --------------------
@@ -48,14 +45,12 @@ constraint row by a characteristic scale. See `_build`.
 The grid is graded rather than uniform -- hourly through the first day, then
 three- and six-hourly. Only the near term is ever implemented, because the plan
 is rebuilt every three hours; the far end exists to value the terminal
-inventories. `bookkeeping/04_PLANNER_TRACTABILITY.md` records what that bought
-and what it cost.
+inventories.
 
-Curtailment is a free variable rather than a residue here, which is the one place
-the planner's world differs structurally from the bus's. It has to be: the
-planner must be *able* to choose to spill, since deciding what not to absorb is a
-real scheduling decision. The bus then computes curtailment as a residue when the
-plan meets reality.
+Curtailment is a free variable rather than a residue here, the one place the
+planner's world differs structurally from the bus's. It has to be: deciding what
+not to absorb is a real scheduling decision. The bus then computes curtailment
+as a residue when the plan meets reality.
 """
 
 from __future__ import annotations
@@ -152,8 +147,7 @@ class EconomicPlanner(Controller):
         #:
         #: Raising this is safe -- the planner shortens its own target to the
         #: longest horizon that converged and warns once -- but the default is
-        #: set to what works so that no run pays 452 s for a failed stage.
-        #: `bookkeeping/04_PLANNER_TRACTABILITY.md` has the measurements.
+        #: set to what works, so no run pays 452 s for a failed stage.
         horizon_hours: int = 72,
         replan_interval_s: float = 3 * 3600.0,
         terminal_value_fraction: float = 0.5,
@@ -174,16 +168,12 @@ class EconomicPlanner(Controller):
         self.sabatier_start_cost_EUR = float(sabatier_start_cost_EUR)
         self.commit_threshold = float(commit_threshold)
         self.max_iter = int(max_iter)
-        # A planning tolerance, not a physics tolerance. IPOPT's default 1e-6
-        # spends hundreds of iterations polishing a schedule whose inputs are a
-        # weather forecast; the model error dwarfs the solver error by orders of
-        # magnitude long before that.
-        #
-        # At the full horizon this is what decides whether there is a plan at
-        # all. Measured at 168 h, the solver reached a constraint violation of
-        # 6e-9 -- primal-feasible by any standard anyone cares about -- and then
-        # spent its whole iteration budget failing to tighten the *dual* to 1e-5.
-        # The schedule was usable; only the convergence test disagreed.
+        # A planning tolerance, not a physics tolerance: IPOPT's default 1e-6
+        # polishes a schedule whose inputs are a weather forecast, and the model
+        # error dwarfs the solver error long before that. At 168 h this decides
+        # whether there is a plan at all -- the solver reached a constraint
+        # violation of 6e-9 and then spent its whole budget failing to tighten
+        # the *dual* to 1e-5, on a schedule that was already usable.
         self.tol = float(tol)
         self._backend_spec = backend
         if name:
@@ -205,10 +195,9 @@ class EconomicPlanner(Controller):
         self.backend = (
             self._backend_spec
             if isinstance(self._backend_spec, SolverBackend)
-            # `expand=False`: this horizon is two orders larger than the inner
-            # NMPC's, where SX expansion measured 2.4x faster. Expansion cost
-            # and memory both grow with the graph and the trade has not been
-            # measured at this size, so the legacy planner keeps MX.
+            # `expand=False`: SX expansion measured 2.4x faster on the inner
+            # NMPC, but its cost and memory grow with the graph and the trade is
+            # unmeasured at this horizon, so this planner keeps MX.
             else get_backend(self._backend_spec, expand=False,
                              max_iter=self.max_iter,
                              tol=self.tol, acceptable_tol=self.tol * 100.0)
@@ -245,12 +234,10 @@ class EconomicPlanner(Controller):
         for key in COMMITTED:
             e = float(u[ui(f"{key}_on")])
             raw = float(np.clip(u[ui(_SETPOINT_OF[key])], 0.0, 1.0))
-            # Commit whenever the plan intends output, not only when the relaxed
-            # enable clears 0.5. Rounding an enable of 0.45 down to off discards
-            # the setpoint of 0.42 underneath it -- measured on the contactor,
-            # twelve intervals planned at 38-42 % flow and every one shut off by
-            # the rounding. Rounding up costs the idle draw and keeps the
-            # production, which is much the better error.
+            # Commit whenever the plan intends output, not only when the
+            # relaxed enable clears 0.5: rounding 0.45 down discards the
+            # setpoint of 0.42 underneath it. Rounding up costs the idle draw
+            # and keeps the production.
             committed = e >= self.commit_threshold or raw > 1e-4
             enables[key] = 1.0 if committed else 0.0
             # The setpoint is the rate; the enable only priced the parasitic
@@ -320,30 +307,24 @@ class EconomicPlanner(Controller):
         warm = self._shifted_warm_start(t)      # (grid, states, controls) or None
         solution, solved_grid, grid = attempt(warm)
 
-        # A warm start is normally the cheapest route and occasionally the worst
-        # one: the previous plan can sit in a basin the new weather has made
-        # infeasible. Falling back to a cold solve costs one extra homotopy but
-        # recovers, where keeping the stale plan would degrade for the rest of
-        # the run and report a failure at every tick.
+        # A warm start is usually cheapest and occasionally worst: the previous
+        # plan can sit in a basin the new weather made infeasible. A cold retry
+        # costs one extra homotopy and recovers.
         if solution is None and warm is not None:
             stage_log.append("cold retry")
             solution, solved_grid, grid = attempt(None)
 
         self._solves += 1
         self._diagnostics["plan_stages"] = " | ".join(stage_log)
-        # A later stage may have failed after an earlier one succeeded. Keep the
-        # best *converged* horizon rather than the longest attempted one -- a
-        # three-day plan that solved is worth more than a seven-day one that did
-        # not, and the grid must match the solution it came from.
+        # A later stage may fail after an earlier one succeeded. Keep the best
+        # *converged* horizon, and the grid that matches it.
         grid = solved_grid if solution is not None else grid
         n = len(grid)
 
-        # If the full horizon did not converge but a shorter one did, shorten the
-        # target permanently rather than re-attempting the same failure every
-        # three hours. Without this the homotopy -- which only runs on a cold
-        # start -- would be skipped on every later replan, the single full-horizon
-        # solve would fail again, and the planner would run the rest of the
-        # simulation on an ever-staler plan while reporting a failure each time.
+        # If a shorter horizon converged, shorten the target permanently rather
+        # than re-attempting the same failure every three hours. The homotopy
+        # only runs on a cold start, so without this every later replan repeats
+        # the single full-horizon solve that already failed.
         if solution is not None:
             achieved = int(round(float(np.sum(grid)) / 3600.0))
             if achieved < target and achieved > 0:
@@ -523,14 +504,11 @@ class EconomicPlanner(Controller):
         u_lo, u_hi = self._control_bounds()
         guess_z, guess_u = self._rollout_guess(n, z0, weather, grid)
 
-        # Per-interval control bounds, so the curtailment fraction can be pinned
-        # where it means nothing. With no sun, `pv * (1 - gamma)` is zero for
-        # every gamma: the variable has no effect on any constraint or on the
-        # objective, so it is a flat direction the solver is free to wander
-        # along. It also breaks the primal-side check that lambda is zero
-        # wherever curtailment is interior -- at night gamma sits at some
-        # arbitrary interior value while lambda is correctly high, which looks
-        # exactly like a broken price and is not one.
+        # Per-interval control bounds, so curtailment can be pinned where it
+        # means nothing. With no sun `pv * (1 - gamma)` is zero for every gamma,
+        # a flat direction for the solver to wander along -- and it breaks the
+        # check that lambda is zero wherever curtailment is interior, since at
+        # night gamma sits arbitrarily while lambda is correctly high.
         tiled_lo = np.tile(u_lo, (n, 1))
         tiled_hi = np.tile(u_hi, (n, 1))
         dark = np.asarray(weather["pv_available_W"], dtype=float) < 1.0
@@ -607,12 +585,11 @@ class EconomicPlanner(Controller):
             profit = profit + model.stage_profit_EUR(Z[k], U[k], w, self.economics, dt, rates)
 
         # --- reactor light-off ------------------------------------------------
-        # `max(e_k - e_{k-1}, 0)` written directly in the objective is a kink
-        # sitting exactly where the solver spends most of its time, since the
-        # reactor's commitment is unchanged at almost every hour. The standard
-        # epigraph form is exact and smooth: a non-negative variable bounded
-        # below by the increase, with a positive cost that drives it to that
-        # bound. This is the `s_k >= e_k - e_{k-1}` of the written formulation.
+        # `max(e_k - e_{k-1}, 0)` in the objective is a kink sitting exactly
+        # where the solver spends its time, since commitment is unchanged at
+        # almost every hour. The epigraph form is exact and smooth: a
+        # non-negative variable bounded below by the increase, with a positive
+        # cost driving it to that bound.
         starts = b.variable("sabatier_starts", n - 1, lb=0.0, ub=1.0, x0=0.0)
         b.constraint(
             "start_counter",
@@ -751,9 +728,8 @@ class EconomicPlanner(Controller):
         producing. Battery charge is priced through the same chain, at the
         electrolyser's specific energy.
 
-        The tex proposes taking these prices from the previous solve's duals,
-        which is better and is a natural upgrade at M6; a fixed fraction is used
-        here because a first implementation should not depend on its own output.
+        Taking these prices from the previous solve's duals would be better, but
+        a fixed fraction avoids making the planner depend on its own output.
         """
         model = self.model
         price = self.economics.p.methane_price_per_kg * M_CH4  # EUR per mol CH4

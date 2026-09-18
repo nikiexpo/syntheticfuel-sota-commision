@@ -1,29 +1,24 @@
 """A/B harness for inner-NMPC solver changes, on states that are actually busy.
 
-Why replay rather than a short simulation
------------------------------------------
-Every timing number in this project so far has been distorted one of two ways.
+Replay rather than a short simulation, because timing measured in closed loop is
+distorted two ways:
 
-**Idle windows.** A quarter-day run from midnight is 99.8 % night: nothing is
-committed, `capped` is empty, the problems are trivial, and the filter reported
-98.6 % success -- which then fell to 78 % over three days. Solve cost tracks how
-much of the plant is *running*, not elapsed time, so a benchmark that averages
-over darkness measures almost nothing.
+**Idle windows.** A quarter-day run from midnight is 99.8 % night -- nothing
+committed, trivial problems, 98.6 % success that then fell to 78 % over three
+days. Solve cost tracks how much of the plant is *running*, not elapsed time.
 
-**Feedback divergence.** Two solver variants in closed loop stop seeing the same
-states after the first difference, so their timings are not comparable.
+**Feedback divergence.** Two solver variants stop seeing the same states after
+the first difference, so their timings are not comparable.
 
-This harness fixes both. It replays a **fixed sequence of consecutive states**,
-sampled from a real `dispatch` trajectory and filtered to intervals where at
-least `MIN_COMMITTED` machines are running. Every variant sees byte-identical
-inputs, so a difference in iterations is a difference in the solver and nothing
-else. Consecutive states are kept in order, because that is what makes a warm
-start meaningful -- a shuffled set would test cold starts wearing a disguise.
+This harness replays a **fixed sequence of consecutive states**, sampled from a
+real `dispatch` trajectory and filtered to intervals where at least
+`MIN_COMMITTED` machines run. Every variant sees byte-identical inputs, so a
+difference in iterations is a difference in the solver. The states are kept in
+order, because that is what makes a warm start meaningful.
 
-The states come from a `dispatch`-only run, so they are not exactly what
-`dispatch-nmpc` would visit. That is deliberate: a fixed reference trajectory is
-a controlled experiment, and the alternative -- each variant generating its own
-states -- is the thing being avoided.
+They come from a `dispatch`-only run, so they are not exactly what
+`dispatch-nmpc` would visit -- deliberately, since a fixed reference trajectory
+is what makes this a controlled experiment.
 """
 
 from __future__ import annotations

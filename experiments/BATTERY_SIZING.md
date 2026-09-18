@@ -2,7 +2,7 @@
 
 **Run:** 17 September 2026 · `experiments/battery_sizing.py`
 **Data:** `results/battery_sizing.csv` (40 cells) · `results/series/` (10 trajectories)
-**Figures:** `figures/A1`–`A6`
+**Figures:** `figures/A1`–`A7`
 
 Five battery sizes × two controllers × four seasonal windows × **7 days
 closed-loop**, at Seville, 1100 kWp, controller price fixed at €5.50/kg, seed 0.

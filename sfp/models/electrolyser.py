@@ -5,8 +5,6 @@ paper resolves mole balances, membrane transport and cell voltage but not stack
 temperature, and temperature matters for scheduling because it moves the ohmic
 overpotential and therefore the efficiency the planner sees.
 
-The one behaviour that changes the optimal policy
--------------------------------------------------
 **Total efficiency peaks well below rated load.** Two effects fight:
 
     stack efficiency   falls with current   (activation + ohmic overpotentials)
@@ -20,26 +18,22 @@ so the total has an interior maximum. At the reference sizing:
      50 %     0.69         0.62      <- peak
     100 %     0.64         0.61
 
-A power-follow controller pushes the stack to 100 % whenever the sun is strong
-and gives up a couple of points of efficiency for nothing, because that marginal
-kilowatt was worth more in the kiln. Note this emerges from the polarisation
-curve and a fixed auxiliary load -- it is not a penalty term someone imposed.
+A power-follow controller pushes to 100 % whenever the sun is strong and gives
+up a couple of points for nothing, because that marginal kilowatt was worth more
+in the kiln. This emerges from the polarisation curve and a fixed auxiliary
+load; it is not an imposed penalty.
 
 Activation overpotential uses the **inverse-hyperbolic-sine form** of
 Butler-Volmer rather than the Tafel logarithm:
 
     eta_act = (RT / alpha F) * asinh( i / 2 i_0 )
 
-Tafel is only valid well above the exchange current density and diverges to
--infinity as i -> 0, which would wreck an NLP that wants to evaluate the stack at
-zero load. asinh is exact at all currents, smooth through the origin, and agrees
-with Tafel wherever Tafel is valid. This is a small choice that matters a lot for
-whether the M4 optimiser converges.
+Tafel diverges to -infinity as i -> 0, which wrecks an NLP that evaluates the
+stack at zero load. asinh is exact at all currents, smooth through the origin,
+and agrees with Tafel wherever Tafel is valid.
 
 Thermal management is a **local regulatory loop**, not a supervisory decision:
-the stack looks after its own temperature with a proportional cooling controller,
-because that is how real stacks work and because giving the planner a coolant
-valve to optimise would be modelling theatre.
+the stack regulates its own temperature, as real stacks do.
 """
 
 from __future__ import annotations

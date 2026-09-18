@@ -1,29 +1,20 @@
 """Gas buffers and the water balance -- the inventories that decouple the plant.
 
-Two subsystems here, both pure accumulators with no manipulated variables of
-their own. Everything that moves material through them is computed by the
-producing and consuming subsystems and arrives as coupling signals through `w`
-(see `sfp.sim.plant.Plant` for the two-phase evaluation that makes that work).
+Two subsystems, both pure accumulators with no manipulated variables of their
+own. Everything that moves material through them is computed by the producing
+and consuming subsystems and arrives as coupling signals through `w`.
 
-Why the sizes are what they are
--------------------------------
-The gas buffers are deliberately modest -- about 6-8 hours each -- while the
-CaCO3 inventory in `SolidsInventory` holds roughly 12 hours of CO2 demand. That
-is not an accident of tuning. A mole of CO2 stored as calcium carbonate sits in
-an unpressurised pile of rock and costs essentially nothing to hold; the same
-mole stored as gas needs a pressure vessel. Making the gas buffers large would
-quietly solve the plant's intermittency problem with capital instead of control,
-and would hide the thing this project is about.
+The gas buffers are deliberately modest -- 6-8 hours each -- against roughly 12
+hours of CO2 demand held as CaCO3. A mole of CO2 stored as carbonate sits in an
+unpressurised pile of rock; the same mole as gas needs a pressure vessel.
+Oversizing the gas buffers would solve the intermittency problem with capital
+instead of control. The hydrogen tank is the exception and must be generous: it
+is what lets the reactor run at night on hydrogen made at noon.
 
-The hydrogen tank is the one buffer that must be generous, because it is what
-lets the Sabatier reactor run at night on hydrogen made at noon.
-
-Water
------
-Easy to forget and genuinely binding at an arid site. Electrolysis consumes
-4 mol H2O per mol CH4 eventually produced; the Sabatier reaction gives 2 of them
-back. With 95 % condensate recovery the net is about 2.36 kg of water per kg of
-methane -- delivered by road at a remote site, so it carries a real cost.
+Water is easy to forget and genuinely binding at an arid site. Electrolysis
+consumes 4 mol H2O per mol CH4; the Sabatier reaction returns 2. With 95 %
+condensate recovery the net is ~2.36 kg of water per kg of methane, delivered
+by road at a remote site.
 """
 
 from __future__ import annotations

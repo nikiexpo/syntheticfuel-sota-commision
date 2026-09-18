@@ -31,7 +31,7 @@ params:
       earlier 0.25 mol/s feed cap this tank sat pinned on its 5 % cushion for an
       entire 10-day run, because the reactor could outrun the electrolyser at
       every instant regardless of how much storage sat between them. The fix was
-      the feed cap, not the vessel. See bookkeeping/03_SIZING.md.
+      the feed cap, not the vessel.
 
   h2_initial_fraction:
     value: 0.30

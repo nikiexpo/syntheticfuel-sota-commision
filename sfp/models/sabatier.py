@@ -1,37 +1,27 @@
 """Sabatier methanation reactor: CO2 + 4 H2 -> CH4 + 2 H2O, dH = -165 kJ/mol.
 
-Lumped from the three-zone axial model of Moioli, Gallandat & Zuttel (2019).
-That paper's result is that a small-scale Sabatier reactor lives or dies on its
-axial heat-transfer profile -- an activation zone that must stay hot enough to
-light, a middle zone that must dump heat fast enough to avoid sintering, and a
-final zone that must cool back down to approach equilibrium. For a scheduling
-model none of that axial detail is needed; what is needed is the aggregate
-consequence:
+Lumped from the three-zone axial model of Moioli, Gallandat & Zuttel (2019). A
+scheduling model needs only the aggregate consequence of that axial profile: a
+hotspot temperature confined to a window, and a conversion set by how close that
+temperature lets the reactor approach equilibrium.
 
-    a hotspot temperature confined to a window, and a conversion set by how close
-    that temperature lets the reactor approach equilibrium
+It is **nearly free to run once lit** -- strongly exothermic and self-sustaining,
+so the draw is just the recycle blower and condenser, ~8 kW against the
+electrolyser's 328 kW. That makes it the natural night-time load, drawing down
+hydrogen and CO2 banked during the day.
 
-Why this reactor shapes the whole control strategy
---------------------------------------------------
-It is **nearly free to run once lit**. The reaction is strongly exothermic and
-sustains its own temperature, so the electrical draw is just the recycle blower
-and condenser -- about 8 kW against the electrolyser's 328 kW. That makes it the
-natural night-time load: it draws down hydrogen and CO2 banked during the day and
-turns them into product while the sun is down and the battery is precious.
+Starting it costs ~31 kWh of electric preheat and ages the catalyst by one
+thermal cycle. The default policy is light it once and keep it lit; the
+planner's job is to notice when that is wrong.
 
-Starting it is a different matter: ~31 kWh of electric preheat, and every thermal
-cycle ages the catalyst. So the default policy is light it once and keep it lit;
-the planner's job is to notice the cases where that is wrong.
+Two competing temperature pressures:
 
-Two competing temperature pressures
------------------------------------
     hotter -> faster kinetics, so a closer approach to equilibrium
     hotter -> a *lower* equilibrium conversion (the reaction is exothermic)
            -> and accelerating catalyst sintering above ~400 degC
 
-The product of a rising kinetic term and a falling equilibrium term gives an
-interior optimum around 300-350 degC. Constraint and economics point the same
-way here, which is a comfortable place to be.
+giving an interior optimum around 300-350 degC, where constraint and economics
+happen to agree.
 """
 
 from __future__ import annotations

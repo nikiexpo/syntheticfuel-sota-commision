@@ -1,32 +1,29 @@
 """The plant: coupled subsystems sharing one DC bus and several material buffers.
 
-Holds the concatenated state vector, knows how to slice it per subsystem, and --
-new in M1 -- resolves the coupling between subsystems.
+Holds the concatenated state vector, slices it per subsystem, and resolves the
+coupling between subsystems.
 
 The coupling problem
 --------------------
-Subsystems are no longer independent. The solids inventory is driven by rates
-computed in the contactor and the calciner; the gas buffers are driven by the
-calciner, the electrolyser and the reactor; the reactor's feed is throttled by
-what the gas buffers actually hold. None of that fits through a subsystem's own
-inputs, because none of it is a decision -- it is physics between components.
-
-So evaluation happens in two phases:
+The solids inventory is driven by rates computed in the contactor and the
+calciner; the gas buffers by the calciner, the electrolyser and the reactor; the
+reactor's feed is throttled by what the buffers hold. None of that fits through
+a subsystem's own inputs, because none of it is a decision -- it is physics
+between components. So evaluation happens in two phases:
 
     phase 1   outputs, in registration order, each subsystem seeing the weather,
               every subsystem's *state*, and the outputs of everything before it
     phase 2   dx/dt, every subsystem seeing the complete set of outputs
 
-Phase 1 is order-dependent, which is a real hazard: a subsystem reading a
-coupling key that has not been produced yet would get `w.get(key, 0.0)`, and a
-silent zero rate looks exactly like a plant that chose not to run. So each
-subsystem declares what it `requires` and `provides`, and `Plant` verifies the
-ordering at construction. Get the order wrong and you get an exception naming
-the offending key, not a quietly wrong simulation.
+Phase 1 is order-dependent and that is a hazard: reading a coupling key not yet
+produced gives `w.get(key, 0.0)`, and a silent zero rate looks exactly like a
+plant that chose not to run. So each subsystem declares what it `requires` and
+`provides`, and `Plant` verifies the ordering at construction -- a wrong order
+raises, naming the key.
 
-Phase 2 has no ordering constraint, which is why the genuinely circular couplings
-(the gas buffer needs the reactor's draw, the reactor needs the buffer's level)
-live there.
+Phase 2 has no ordering constraint, which is where the genuinely circular
+couplings live (the gas buffer needs the reactor's draw, the reactor needs the
+buffer's level).
 """
 
 from __future__ import annotations
@@ -167,11 +164,11 @@ class Plant:
         for key, sub in self:
             produced = sub.outputs(t, states[key], u[key], context)
             for name, value in produced.items():
-                # Each subsystem reports its own draw as `power_electrical_W`, so
-                # namespace it. It is also stored under `power.<key>`, which is
-                # the canonical channel the bus and the metrics read: matching on
-                # a `_power_W` suffix would wrongly pick up quantities like
-                # `contactor_fan_power_W` that are components of a draw, not draws.
+                # Every subsystem reports its draw as `power_electrical_W`, so
+                # namespace it. `power.<key>` is the canonical channel the bus
+                # and the metrics read; matching a `_power_W` suffix instead
+                # would pick up components of a draw such as
+                # `contactor_fan_power_W`.
                 if name == "power_electrical_W":
                     outputs[f"{key}_power_W"] = value
                     outputs[f"power.{key}"] = value
@@ -202,12 +199,10 @@ class Plant:
     def rhs(self, t: float, x: np.ndarray, u: Mapping[str, np.ndarray], w: Mapping[str, Any]):
         """Phase 2. Combined dx/dt with every coupling signal resolved.
 
-        Dispatches on whether anything in the assembled derivative is symbolic,
-        so the same coupled model serves the simulator numerically and the inner
-        NMPC symbolically. Forcing the numeric path (`np.asarray(..., float)`)
-        unconditionally is what would otherwise stop the controller from using
-        the plant's own equations -- and a controller with its own re-typed copy
-        of the dynamics is the thing this project exists to avoid.
+        Dispatches on whether the assembled derivative is symbolic, so the same
+        coupled model serves the simulator numerically and the inner NMPC
+        symbolically. Forcing the numeric path would leave the controller with
+        a re-typed copy of the dynamics.
         """
         _, context = self.evaluate(t, x, u, w)
         states = self.split(x)
@@ -242,12 +237,10 @@ class Plant:
     ) -> np.ndarray:
         """One fixed-step RK4 advance with a zero-order hold on `u` and `w`.
 
-        `clip=False` skips the projection back into the state box, which is
-        required for symbolic use: `clip_state` calls `np.array(..., dtype=float)`
-        and cannot accept a CasADi expression. It is also the *right* thing for an
-        optimiser, which enforces those bounds as explicit constraints -- clipping
-        inside the dynamics would hide a violation from the solver rather than
-        letting it see and respect the bound.
+        `clip=False` skips the projection into the state box. Required for
+        symbolic use (`clip_state` cannot accept a CasADi expression) and the
+        right thing for an optimiser, which enforces those bounds as explicit
+        constraints; clipping inside the dynamics would hide violations.
         """
         if self.n_states == 0:
             return x

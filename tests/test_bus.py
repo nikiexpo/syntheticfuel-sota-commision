@@ -4,9 +4,9 @@ This is the safety layer, so it is tested adversarially: the requests here
 deliberately ask for impossible things. A bus that can be talked into an
 unbalanced dispatch by a bad controller is not a safety layer.
 
-The M1 bus also has to arbitrate between four competing loads and cope with a
-draw it cannot command at all (the CO2 compressor follows the calcination rate),
-so the coverage below is about arbitration as much as arithmetic.
+The bus also arbitrates between four competing loads and copes with a draw it
+cannot command at all (the CO2 compressor follows the calcination rate), so the
+coverage below is about arbitration as much as arithmetic.
 """
 
 from __future__ import annotations

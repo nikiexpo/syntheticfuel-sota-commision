@@ -304,15 +304,11 @@ def test_lambda_is_lower_when_the_sun_is_up(solved):
 def test_commitment_rounding_is_harmless(solved):
     """Rounding `e` at 0.5 must not change what the plant is asked to do.
 
-    This used to assert the stronger property that `e = s` everywhere at the
-    optimum, on the reasoning that a smaller enable means less parasitic draw and
-    nothing else depends on it. That reasoning is incomplete, and the solver
-    found the gap: with a start-up cost in epigraph form (`s_k >= e_k - e_{k-1}`)
-    it can be worth *holding* a partial commitment through an idle interval to
-    avoid paying a full start at the next one. Measured, the reactor sat at
-    `e = 0.465` with `s = 0`, drawing 3.7 kW of parasitic load at about
-    EUR 0.19/h to avoid a EUR 2.00 start-up. That is the optimiser being right,
-    not wrong.
+    Deliberately weaker than `e = s` everywhere at the optimum, because that is
+    not true: with a start-up cost in epigraph form (`s_k >= e_k - e_{k-1}`) it
+    can be worth *holding* a partial commitment through an idle interval to
+    avoid a full start at the next one. Measured, the reactor sat at `e = 0.465`
+    with `s = 0`, drawing 3.7 kW at ~EUR 0.19/h to avoid a EUR 2.00 start-up.
 
     What has to hold is the property the rounding actually relies on: wherever a
     machine is committed after rounding, its setpoint is the one planned; and

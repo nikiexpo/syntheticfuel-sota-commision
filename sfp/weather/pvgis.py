@@ -1,8 +1,7 @@
 """Weather input: PVGIS typical meteorological year, with an offline fallback.
 
-PVGIS (EU Joint Research Centre) is the data source named in the project README
-and it covers all of Europe, which is the deployment region the brief specifies.
-We use the TMY endpoint because it gives, on one hourly index, every driver this
+PVGIS (EU Joint Research Centre) covers all of Europe, the deployment region the
+brief specifies. The TMY endpoint gives, on one hourly index, every driver this
 plant model needs:
 
     G(h), Gb(n), Gd(h)   GHI / DNI / DHI  -> PV output
@@ -10,9 +9,8 @@ plant model needs:
     RH                   relative humidity-> carbonation rate (moisture promotes it)
     WS10m                wind speed       -> module and kiln convective losses
 
-Results are cached under `data/cache/` keyed by rounded coordinates, so a siting
-sweep hits the network once per site and every later run is offline and
-reproducible.
+Results are cached under `data/cache/` keyed by rounded coordinates, so a sweep
+hits the network once per site and every later run is offline and reproducible.
 
 If the network is unavailable, `load_weather` falls back to a synthetic year
 built from the clear-sky model times a stochastic clear-sky index. That keeps the

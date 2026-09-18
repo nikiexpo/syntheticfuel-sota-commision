@@ -8,38 +8,33 @@ A controller -- optimal, rule-based or broken -- hands down a `Request` of
 setpoints. This module turns it into a `Dispatch` that actually balances, and
 records how far it had to move the request to get there.
 
-What changed at M1
-------------------
-There is no longer a single load. Four subsystems compete for the same bus, and
-they are not interchangeable, so when supply falls short the bus sheds in a fixed
-priority order rather than scaling everything down proportionally:
+Four subsystems compete for the same bus and they are not interchangeable, so
+when supply falls short the bus sheds in a fixed priority order rather than
+scaling everything down proportionally:
 
     shed first   calciner      biggest and most deferrable -- CaCO3 keeps
                  contactor     cheap, and the sorbent will still be there later
                  electrolyser  flexible, but its H2 feeds the reactor
     shed last    sabatier      protects product in progress and the catalyst
 
-That ordering is a plant-engineering judgement, not an optimisation: the bus's
-job is to keep the plant alive and feasible, and the *controller's* job is to
-make sure the bus never has to intervene. A rising intervention count means the
+That ordering is a plant-engineering judgement, not an optimisation. The bus's
+job is to keep the plant feasible; the *controller's* job is to make sure the
+bus never has to intervene, so a rising intervention count means the
 controller's model of its own plant is wrong.
 
-Two subtleties worth knowing
-----------------------------
+Two subtleties
+--------------
 **Turning the Sabatier feed down saves nothing.** Its draw is preheat plus
-auxiliaries, essentially independent of feed rate (8 kW at any feed). The only
-way to shed it is to shut it off, which costs a 31 kWh relight later. The bus
-therefore treats it as all-or-nothing.
+auxiliaries, ~8 kW at any feed, so the only way to shed it is to shut it off at
+the cost of a 31 kWh relight. The bus treats it as all-or-nothing.
 
-**The CO2 compressor is not commanded.** Its draw follows the calcination rate,
-so it cannot be sized directly. The bus allocates the controllable subsystems
-using their own power curves, then evaluates the *whole plant* to get the exact
-total including the compressor, and repeats if that pushed it over budget. That
-is why `reconcile` needs the plant and its state rather than just a few numbers.
+**The CO2 compressor is not commanded.** Its draw follows the calcination rate.
+The bus allocates the controllable subsystems from their own power curves, then
+evaluates the *whole plant* for the exact total, and repeats if that pushed it
+over budget -- which is why `reconcile` needs the plant and its state.
 
-Curtailment remains a **residue, not a decision**: `pv_available - pv_used`. It is
-PV that was available and that nothing could absorb. Off-grid that has nothing to
-do with grid limits.
+Curtailment is a **residue, not a decision**: `pv_available - pv_used`, PV that
+nothing could absorb. Off-grid it has nothing to do with grid limits.
 """
 
 from __future__ import annotations
@@ -153,14 +148,12 @@ def _plant_load_W(plant, t, x, setpoints, enables, w):
     """Exact total plant load for a candidate dispatch, including the compressor.
 
     Evaluates the whole coupled plant rather than summing per-subsystem power
-    curves, because some draws (the CO2 compressor most of all) follow reaction
+    curves, because some draws (the CO2 compressor above all) follow reaction
     rates rather than commands.
 
     Returns the total, the per-subsystem loads, and the full output dictionary.
-    The last of these is handed back so the simulator can log it instead of
-    evaluating the same plant, at the same state and inputs, a second time --
-    a full evaluation is the most expensive operation in the loop and there were
-    about seven of them per timestep.
+    The last is handed back so the simulator can log it rather than repeat the
+    loop's most expensive call at identical arguments.
     """
     u = _inputs_from(plant, setpoints, enables)
     outputs, _ = plant.evaluate(t, x, u, w)
@@ -210,13 +203,9 @@ def reconcile(
     charge_limit = float(battery.max_charge_power_W(battery_state, dt_s))
     physical_discharge_limit = float(battery.max_discharge_power_W(battery_state, dt_s))
 
-    # The controller's requested discharge is a *cap*, not a demand. Honouring it
-    # is what lets a controller hold an evening reserve: it says "you may draw at
-    # most this much from the pack", and the bus sheds load rather than digging
-    # deeper. Ignoring it -- as an earlier version did, discharging whatever the
-    # deficit required -- silently defeats every reserve policy a controller
-    # might have, and the plant then blacks out at 3 a.m. having spent the
-    # battery on the afternoon's electrolyser.
+    # The requested discharge is a *cap*, not a demand: "draw at most this much
+    # from the pack", and the bus sheds load rather than digging deeper. This is
+    # what lets a controller hold an evening reserve at all.
     discharge_limit = min(physical_discharge_limit, max(request.battery_discharge_W, 0.0))
 
     pv_offer = max(pv_available_W * (1.0 - float(np.clip(request.curtail_fraction, 0.0, 1.0))), 0.0)
@@ -278,9 +267,8 @@ def reconcile(
 
     # --- stage 3: exact total, then settle the supply side -----------------
     unserved_W = 0.0
-    # The evaluation below is the single most expensive call in the simulation
-    # loop, so it is done once per pass and its result carried forward rather
-    # than recomputed after the loop.
+    # The most expensive call in the simulation loop: done once per pass, with
+    # the result carried forward rather than recomputed afterwards.
     total_load, loads, plant_outputs = _plant_load_W(
         plant, t, state, setpoints, enables, weather
     )

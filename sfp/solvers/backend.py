@@ -13,18 +13,14 @@ index.
     min  f(x)   s.t.   lbg <= g(x) <= ubg,   lbx <= x <= ubx
 
 `SolverBackend` solves one. The contract is deliberately narrow -- everything a
-backend needs is available as a numerical callable through `NLP.functions()`, so a
-backend does *not* have to be CasADi-based. That is the M7 swap point: the custom
-NLP solver consumes f, g, their derivatives and the Lagrangian Hessian, and never
-sees a CasADi solver object.
+backend needs is a numerical callable through `NLP.functions()` -- so a backend
+need not be CasADi-based: it consumes f, g, their derivatives and the Lagrangian
+Hessian, and never sees a CasADi solver object.
 
-Duals are first-class, not an afterthought
-------------------------------------------
-The whole hierarchical architecture rests on one number: lambda, the dual of the
-planner's energy-balance constraint, which becomes the internal electricity price
-the inner NMPC optimises against. A `Solution` therefore carries `lam_g` and can
-return it by constraint name via `dual(name)`. A backend that cannot report duals
-is not usable for the outer layer, and says so through `provides_duals`.
+Duals are first-class. Lambda, the dual of the energy-balance constraint, is the
+internal electricity price the price-coordinated hierarchy runs on, so a
+`Solution` carries `lam_g` and returns it by constraint name via `dual(name)`.
+A backend that cannot report duals says so through `provides_duals`.
 """
 
 from __future__ import annotations
@@ -64,9 +60,9 @@ class Block:
 class NLPFunctions:
     """Numerical callables for a problem: f, g and their derivatives.
 
-    This is the entire surface a solver backend needs. It is deliberately plain
-    -- numpy in, numpy out -- so that a backend written without CasADi can be
-    dropped in at M7 against exactly this contract.
+    The entire surface a solver backend needs, deliberately plain -- numpy in,
+    numpy out -- so a backend written without CasADi can be dropped in against
+    exactly this contract.
     """
 
     n_x: int
@@ -82,9 +78,9 @@ class NLPFunctions:
     ) -> float:
         """Infinity norm of the stationarity residual of the Lagrangian.
 
-        Reported alongside every solve so that "it converged" is a measured
-        claim rather than a status string, and so that the M7 comparison between
-        IPOPT and the custom solver is on a quantity both must agree about.
+        Reported alongside every solve so "it converged" is a measured claim
+        rather than a status string, and so two backends can be compared on a
+        quantity both must agree about.
         """
         r = self.grad_f(x) + self.jac_g(x).T @ np.asarray(lam_g, dtype=float).ravel()
         if lam_x is not None:

@@ -1,43 +1,30 @@
 """Rule-based baseline: a credible PLC-style supervisory controller.
 
-This is the strawman worth beating, and keeping it strong is what makes the M3/M4
-comparison mean anything. It is roughly what a competent controls engineer would
-ship without an optimiser: per-subsystem interlocks, buffer-level bands, start/stop
-hysteresis, and an evening reserve. It already knows most of the plant's local
-physics -- and that is the point, because what it still cannot do is *anticipate*.
+The strawman worth beating: roughly what a competent controls engineer would
+ship without an optimiser. Per-subsystem interlocks, buffer-level bands,
+start/stop hysteresis, an evening reserve. It knows the plant's local physics;
+what it cannot do is *anticipate*.
 
-The rules, one subsystem at a time
-----------------------------------
-**Sabatier** -- keep it lit. It is nearly free to run (8 kW) and expensive to
-relight (31 kWh plus catalyst wear), so it runs whenever the buffers hold enough
-of both reactants, and its feed follows the scarcer one. Shut down only when the
-tanks are genuinely empty.
+**Sabatier** -- keep it lit. Nearly free to run (8 kW), expensive to relight
+(31 kWh plus catalyst wear), so it runs whenever both buffers hold enough and
+its feed follows the scarcer one.
 
-**Contactor** -- run at the *cheapest flow that meets demand*, not at full flow.
-Fan power goes as airflow cubed, so this single rule captures most of the
-available saving without any foresight at all. Stop when the sorbent is nearly
-saturated: more air into a full bed is pure waste.
+**Contactor** -- cheapest flow that meets demand, not full flow. Fan power goes
+as airflow cubed. Stop when the sorbent is nearly saturated.
 
-**Calciner** -- the flexible load, and the one this controller handles worst. It
-runs when solar is strong or the battery is comfortable, provided there is CaCO3
-to calcine and room in the CO2 buffer. Temperature hysteresis stops it chasing
-clouds. What it cannot do is decide to hold the kiln warm overnight because
-tomorrow will be sunny, or let it cool because tomorrow will not.
+**Calciner** -- the flexible load, and the one handled worst. Runs on strong
+solar or a comfortable battery, given feedstock and CO2 headroom; temperature
+hysteresis stops it chasing clouds. It cannot hold the kiln warm because
+tomorrow is sunny.
 
-**Electrolyser** -- takes surplus power after the others, biased toward its
-part-load efficiency peak rather than flat out. Stops when the H2 tank is full.
+**Electrolyser** -- surplus after the others, biased toward its part-load
+efficiency peak. Stops when the H2 tank is full.
 
-**Battery** -- charges from genuine surplus, holds a reserve that grows as the
-sun drops, using only the instantaneous solar elevation so this stays an honest
-no-forecast baseline.
+**Battery** -- charges from surplus, holds a reserve that grows as the sun
+drops, from solar elevation alone so this stays an honest no-forecast baseline.
 
-The gap that remains
---------------------
-Every rule above is local and instantaneous. None of them can trade today
-against tomorrow: bank sorbent because a cloudy week is coming, spend the battery
-tonight because tomorrow is clear, or skip a calcination because the marginal
-sorbent damage exceeds the value of the methane. That is exactly the space the
-economic planner occupies.
+Every rule is local and instantaneous: none can trade today against tomorrow.
+That is the space the economic planner occupies.
 """
 
 from __future__ import annotations
@@ -96,9 +83,8 @@ class RuleBasedController(Controller):
         self._sabatier = plant["sabatier"]
         self._dt = context.dt_s
 
-        # The reactor's stoichiometric CO2 demand at full feed sets the capture
-        # target the contactor aims at. Matching production to demand, rather
-        # than maximising it, is most of what the fan-power rule needs.
+        # Capture target: the reactor's stoichiometric CO2 demand at full feed.
+        # Matching demand rather than maximising capture is the fan-power rule.
         self._co2_demand_mol_s = float(self._sabatier.p.co2_feed_max_mol_s)
 
         self._running = {"calciner": False, "sabatier": False, "electrolyser": False}
@@ -167,35 +153,26 @@ class RuleBasedController(Controller):
         enables: dict[str, float] = {}
 
         # --- Sabatier: throttle, do not stop -------------------------------
-        # Feed follows the scarcer reactant, since 4:1 stoichiometry means the
-        # short one throttles the reactor regardless of how much of the other is
-        # banked.
-        #
-        # The reactor stays *lit* down to a very low buffer level and simply runs
-        # slower. An earlier version shut it down whenever the feed capacity fell
-        # below a threshold, which was badly wrong: the reactor cooled from
-        # 264 degC to ambient within hours and then needed a 31 kWh relight, all
-        # because one buffer dipped for a few minutes. Turning down costs almost
-        # nothing; turning off costs a restart and a catalyst thermal cycle.
+        # Feed follows the scarcer reactant: 4:1 stoichiometry means the short
+        # one throttles the reactor however much of the other is banked. The
+        # reactor stays lit to a very low buffer level and simply runs slower --
+        # turning down is nearly free, turning off costs a 31 kWh relight and a
+        # catalyst thermal cycle.
         feed_capacity = min(co2_avail, h2_avail / 4.0)
         want_sabatier = feed_capacity > 5.0
         run_sabatier = self._hysteresis("sabatier", t, want_sabatier)
         enables["sabatier"] = 1.0 if run_sabatier else 0.0
         if run_sabatier:
-            # Ration the buffers over the hours until dawn rather than running at
-            # whatever they can currently supply. At full feed the reactor eats
-            # 1.0 mol/s of H2 while the electrolyser makes at most 0.82 -- so an
-            # unrationed reactor drains the tanks during the day and has nothing
-            # left for the night, which is the exact opposite of what the buffers
-            # are for. Hours-to-dawn needs only a clock and the site latitude.
+            # Ration the buffers over the hours until dawn. At full feed the
+            # reactor eats 1.0 mol/s of H2 against the electrolyser's 0.82, so
+            # an unrationed reactor empties the tanks by dusk -- the opposite of
+            # what the buffers are for. Hours-to-dawn needs only a clock.
             hours_left = self._hours_until_dawn(t, measurement)
             rationed = feed_capacity / max(hours_left * 3600.0, 1800.0)
 
-            # In daylight the electrolyser is topping the tank up continuously,
-            # so the reactor may also consume at the rate hydrogen is arriving --
-            # that throughput is free and does not touch the reserve. Rationing
-            # alone, applied around the clock, leaves the plant under-running all
-            # afternoon and curtailing solar it could have converted.
+            # In daylight the reactor may also consume at the rate hydrogen is
+            # arriving: that throughput never touches the reserve. Rationing
+            # alone would leave the plant under-running all afternoon.
             live_h2 = float(measurement.get("r_electrolysis_h2_mol_s", 0.0))
             flow_through = live_h2 / 4.0
             sustainable = max(rationed, flow_through)
@@ -205,10 +182,9 @@ class RuleBasedController(Controller):
         else:
             setpoints["sabatier"] = 0.0
 
-        # Stoichiometric balance of the two upstream chains. The reactor can only
-        # consume H2 and CO2 in a 4:1 ratio, so whichever side is behind should
-        # get priority -- otherwise the plant fills one tank, empties the other,
-        # and stalls with both a full buffer and an idle reactor.
+        # Stoichiometric balance of the two upstream chains: whichever side is
+        # behind gets priority, or the plant stalls with one buffer full, the
+        # other empty and the reactor idle.
         h2_equivalent = h2_avail / 4.0
         h2_poor = h2_equivalent < 0.8 * max(co2_avail, 1.0)
         co2_poor = co2_avail < 0.8 * max(h2_equivalent, 1.0)
@@ -263,16 +239,11 @@ class RuleBasedController(Controller):
             peak = self._electrolyser.best_efficiency_fraction()
             setpoints["electrolyser"] = float(np.clip(max(by_power, 0.0), 0.0, 1.0))
 
-            # Efficiency only matters while energy is scarce. Sitting at the
-            # part-load peak buys more hydrogen per kilowatt-hour -- but if the
-            # alternative for that kilowatt-hour is being curtailed, then a poor
-            # conversion beats no conversion, and the peak is the wrong target.
-            #
-            # A local controller can see imminent curtailment without any
-            # forecast: the battery is nearly full and there is still surplus
-            # after every other load. Getting this backwards costs real
-            # production; an earlier version held the stack at its 53 % peak
-            # whenever solar was strong and curtailed 6.8 % of the array.
+            # Efficiency only matters while energy is scarce: if the
+            # alternative for a kilowatt-hour is curtailment, poor conversion
+            # beats none. Imminent curtailment is visible without a forecast --
+            # battery nearly full and surplus left after every other load.
+            # Holding the peak regardless curtailed 6.8 % of the array.
             battery_nearly_full = soc > self.soc_charge_target - 0.05
             surplus_at_risk = spare > self._electrolyser.rated_power_W() and battery_nearly_full
             if surplus_at_risk or h2_poor:
@@ -291,13 +262,10 @@ class RuleBasedController(Controller):
             spendable * usable_J * self._battery.p.eta_discharge / 3600.0,
         )
 
-        # The reserve rations *discretionary* load. It must never starve the
-        # parasitics of whatever is still enabled: the reactor's 8 kW is what
-        # protects 31 kWh of relight energy and a catalyst thermal cycle, so
-        # refusing it to protect the battery is a false economy. An earlier
-        # version let the reserve win, and the plant blacked out at 3 a.m. with
-        # charge still in the pack -- the reserve killed the thing it existed to
-        # protect. Above the hard SoC floor, keep-alive always wins.
+        # The reserve rations *discretionary* load only. Starving the
+        # parasitics of an enabled subsystem to protect the battery is a false
+        # economy -- the reactor's 8 kW is what protects 31 kWh of relight.
+        # Above the hard SoC floor, keep-alive always wins.
         if soc > self.soc_stop:
             discharge_request = max(
                 discharge_request, self._parasitic_floor_W(state, enables) * 1.15

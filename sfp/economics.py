@@ -1,28 +1,24 @@
 """Levelised cost of methane -- the objective everything is judged against.
 
-The project README noted that the challenge brief never defines what "operate
-efficiently" means, and that this is a real problem: maximising methane output,
-maximising round-trip energy efficiency and maximising plant utilisation are
-three different policies that disagree about what to do on a cloudy Tuesday.
-
-This module picks one and commits to it:
+The brief never defines "operate efficiently", and that is a real problem:
+maximising methane output, maximising round-trip efficiency and maximising
+utilisation are three policies that disagree about what to do on a cloudy
+Tuesday. This module picks one:
 
     LCOM = (annualised capex + annual opex) / annual methane production   [EUR/kg]
 
-It does three jobs at once. It makes "efficient" precise. It ranks control
-strategies on a single axis. And it is exactly the number the siting tool has to
-report, so the digital twin and the siting study share an objective rather than
-each inventing their own.
+It makes "efficient" precise, ranks control strategies on one axis, and is the
+number the sizing studies report, so twin and study share an objective.
 
 The controller does not optimise LCOM directly -- capex is sunk by then. It
-optimises the *marginal* terms, which is the same thing for scheduling purposes:
+optimises the *marginal* terms, which is the same thing for scheduling:
 
-    revenue         methane produced x price
-    less  wear      battery throughput, process starts, (from M1) sorbent cycles
+    revenue           methane produced x price
+    less  wear        battery throughput, process starts, sorbent cycles
     less  consumables water
 
-`marginal_objective_EUR` implements that, and is the term the M4 planner
-maximises. Curtailment is deliberately not in it -- see the note in the YAML.
+`marginal_objective_EUR` implements that. Curtailment is deliberately not in it
+-- see the note in the YAML.
 """
 
 from __future__ import annotations

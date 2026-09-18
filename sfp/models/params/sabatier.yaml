@@ -43,7 +43,7 @@ params:
       it was never reachable -- and turns the tank from a pipe into a buffer.
 
       At 0.12 mol/s a full night needs 17,300 mol of H2 against 28,500 mol of
-      usable tank, a 1.6x margin. See bookkeeping/03_SIZING.md for the audit.
+      usable tank, a 1.6x margin.
 
   thermal_capacity_J_K:
     value: 400000.0

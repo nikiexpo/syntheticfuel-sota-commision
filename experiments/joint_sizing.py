@@ -1,10 +1,9 @@
 """Experiment B: joint PV x battery sizing, closed loop, two sites.
 
-Successor to the plan-based joint grid in `experiments_old/`, which is
-superseded for the reasons set out in `BATTERY_SIZING.md` §1: the outer LP's
-planned profit is flat across a 15x range of battery capacity while realised
-profit rises 2.5x, so a grid scored on plans measures a different shape from the
-one the plant has.
+Closed loop throughout, for the reason set out in `BATTERY_SIZING.md` §1: the
+outer LP's planned profit is flat across a 15x range of battery capacity while
+realised profit rises 2.5x, so a grid scored on plans measures a different shape
+from the one the plant has.
 
 Design decisions, and why
 -------------------------
@@ -24,8 +23,8 @@ bit-identical at 2200 and 1100 EUR/kW. The four multipliers are exact arithmetic
 over these runs.
 
 **`dispatch-nmpc` only.** `BATTERY_SIZING.md` §3.1 established that the outer
-layer alone is systematically wrong for sizing; re-running it here would double
-the cost to re-demonstrate a settled point.
+layer alone is systematically wrong for sizing, so re-running it here would
+double the cost to re-demonstrate a settled point.
 
 **Two seasons, weighted.** Summer and winter only, combined as
 `0.63*summer + 0.37*winter`. A straight mean understates annual production by
@@ -158,11 +157,9 @@ def main() -> int:
     RESULTS.mkdir(parents=True, exist_ok=True)
     out = RESULTS / "joint_sizing.csv"
 
-    # Resume. The first attempt died at cell 23 of 36 -- exit code 4, no
-    # traceback, an abrupt kill rather than a Python error -- after 5.9 hours.
-    # The per-cell CSV write meant nothing was lost, but without this the
-    # restart would have re-run eighteen completed Seville cells to reach the
-    # thirteen missing London ones.
+    # Resume from the per-cell CSV. An 8.8 h run is long enough to be killed
+    # part way through (this one was, at cell 23 of 36), and without this a
+    # restart re-runs every completed cell to reach the missing ones.
     rows: list[dict] = []
     finished: set = set()
     if out.exists() and not args.fresh:

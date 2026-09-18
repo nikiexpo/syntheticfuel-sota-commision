@@ -366,9 +366,14 @@ def test_mip_duals_come_from_the_fixed_relaxation():
         blocks={"cap": slice(0, 1)},
         integrality=np.array([1.0, 0.0]),
     )
-    sol = solve_lp(problem)
+    # `duals=True` is what buys the second, integer-fixed solve; it is off by
+    # default because nothing in the shipped controller reads lambda.
+    sol = solve_lp(problem, duals=True)
     assert sol.success
     assert sol.x[0] == pytest.approx(1.0, abs=1e-6), "the integer column should be 1"
     assert sol.f == pytest.approx(-1.5, abs=1e-6)
     # relaxing the cap by one unit is worth one more unit of objective
     assert sol.dual("cap")[0] == pytest.approx(1.0, abs=1e-6)
+
+    # and without it there is no dual to read, rather than a silently wrong one
+    assert solve_lp(problem).dual("cap")[0] == pytest.approx(0.0, abs=1e-12)

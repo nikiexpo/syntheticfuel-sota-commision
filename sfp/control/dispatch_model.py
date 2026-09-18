@@ -1,16 +1,14 @@
 """The dispatch layer's model: six buffers and four piecewise-linear machines.
 
-This is the outer layer of the proposed architecture (`bookkeeping/07`), and it
-is deliberately *less* faithful than `planner_model.py`. The argument for giving
-up that fidelity is in the tex; the short version is three measured facts:
+Deliberately *less* faithful than `planner_model.py`, for three measured
+reasons:
 
 1. The outer layer's setpoint schedule is discarded -- only the hand-off reaches
    the plant -- so high-fidelity dynamics buy a schedule nobody runs.
 2. The outer objective was already effectively linear. The reactor's conversion
-   is flat to 0.25 % across its whole feed range, and every other term is exactly
-   linear, so the NLP was paying nonlinear prices for a linear objective.
-3. A 240 h horizon is unreachable as an NLP and takes 0.34 s as an LP, which is
-   what makes a scenario tree possible at all.
+   is flat to 0.25 % across its whole feed range and every other term is exactly
+   linear, so the NLP paid nonlinear prices for a linear objective.
+3. A 240 h horizon is unreachable as an NLP and takes 0.34 s as an LP.
 
 What survives the simplification, because each carries a result worth keeping:
 
@@ -31,14 +29,11 @@ binaries are needed**. That holds only while each rate-versus-dispatch map is
 concave, which is checked at construction -- `PWLMap` raises if it is not, rather
 than silently returning a relaxation that is not tight.
 
-The calciner's idle draw
-------------------------
-Set to the power needed to *hold* the kiln at temperature, `UA dT / eta`, rather
-than the flat 3 kW standby in the YAML. This is both more physical -- a kiln that
-is committed is a kiln being kept hot -- and what makes the rate map linear above
-idle instead of convex-then-linear, which would have broken the exactness
-argument above. It is a change from the existing model and it makes commitment
-meaningfully more expensive: 16.6 kW against 3 kW at the reference sizing.
+The calciner's idle draw is the power needed to *hold* the kiln at temperature,
+`UA dT / eta`, rather than the flat 3 kW standby in the YAML. More physical -- a
+committed kiln is a kiln being kept hot -- and it makes the rate map linear
+above idle rather than convex-then-linear, which would break the exactness
+argument. It makes commitment materially more expensive: 16.6 kW against 3 kW.
 """
 
 from __future__ import annotations
@@ -50,15 +45,14 @@ import numpy as np
 
 from sfp.units import DH_CALCINATION, F_FARADAY, M_CACO3
 
-#: States, in order. The kiln temperature is kept, which is a correction to the
-#: proposal in `bookkeeping/07`.
+#: States, in order.
 #:
-#: That document dropped it and replaced what it was *for* -- making start-up
-#: expensive -- with a start cost and a minimum up-time. Measured, that is not
-#: enough: the kiln needs 5.6 hours at full heater to climb from ambient to
-#: 1200 K, and a dispatch layer that believes a committed kiln calcines
-#: immediately schedules calcination that cannot happen. The sorbent then
-#: saturates, the contactor stops, and the plant makes 17 kg/day.
+#: The kiln temperature is kept rather than replaced by a start cost and a
+#: minimum up-time. Measured, those are not enough: the kiln needs 5.6 hours at
+#: full heater to climb from ambient to 1200 K, and a dispatch layer that
+#: believes a committed kiln calcines immediately schedules calcination that
+#: cannot happen -- the sorbent saturates, the contactor stops, and the plant
+#: makes 17 kg/day.
 #:
 #: Keeping it costs nothing, because **the kiln's energy balance is linear**:
 #:

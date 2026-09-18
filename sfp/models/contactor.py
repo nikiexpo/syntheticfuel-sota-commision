@@ -6,8 +6,6 @@ Purely algebraic -- it owns no states. What it captures goes into
 `SolidsInventory`, and the sorbent state it tapers against lives there too, so
 both arrive through the coupling channel `w`.
 
-The one piece of physics that matters for control
--------------------------------------------------
 Capture and fan power scale differently with airflow:
 
     CO2 offered   ~  V                       (more air, more CO2)
@@ -19,29 +17,20 @@ At the reference sizing, at 20 degC and 60 % RH (verified against the model):
     flow  60 % of max  ->  0.233 mol/s captured for  4.7 kW   (128 kWh/tCO2)
     flow 100 % of max  ->  0.279 mol/s captured for 20.4 kW   (462 kWh/tCO2)
 
-**Twenty percent more CO2 for four and a third times the fan power.** A
-power-follow controller that dumps surplus solar into the fans burns most of it
-for almost nothing, and no amount of cheap electricity makes that a good trade,
-because the fan energy could have gone into the calciner instead. This is a
-genuine, emergent trade-off rather than an imposed penalty, and it is one of the
-clearest places where the planning layer should beat the baselines.
+**Twenty percent more CO2 for four and a third times the fan power**, and that
+fan energy could have gone into the calciner. An emergent trade-off, not an
+imposed penalty.
 
-Note what the right question is. Maximising captured CO2 *per watt* is
-degenerate -- it drives flow to zero, where the single-pass fraction tends to 1
-and the power tends to 0, and the reactor starves. The useful problem is
-constrained: meet the CO2 demand for the least fan energy. See
-`flow_for_capture_rate`.
+Note the right question. Maximising CO2 *per watt* is degenerate -- it drives
+flow to zero, where the single-pass fraction tends to 1, the power to 0, and the
+reactor starves. The useful problem is constrained: meet the CO2 demand for the
+least fan energy. See `flow_for_capture_rate`.
 
-Ambient dependence
-------------------
-Rate rises mildly with temperature (Arrhenius, modest activation energy) and
-with humidity (surface water films catalyse carbonation). The humidity term is
-one of the few places where *where you build the plant* changes process
-performance rather than merely solar yield -- a dry inland site captures less per
-unit of fan energy than a coastal one at the same irradiance. The structure
-follows the ambient-dependence treatment in the open-source DAC model of
-Shakouri Kalfati & Abdulla (2025), though that paper models solid-sorbent TVSA on
-zeolites rather than calcium looping.
+Ambient dependence: rate rises mildly with temperature (Arrhenius) and with
+humidity (surface water films catalyse carbonation), so a dry inland site
+captures less per unit of fan energy than a coastal one at equal irradiance.
+Structure follows the ambient-dependence treatment of Shakouri Kalfati &
+Abdulla (2025), whose own chemistry is solid-sorbent TVSA, not calcium looping.
 """
 
 from __future__ import annotations

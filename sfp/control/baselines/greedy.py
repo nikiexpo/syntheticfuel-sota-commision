@@ -4,21 +4,19 @@ The comparison the challenge brief names explicitly. It is not a caricature --
 it is what an unsupervised plant with a simple power-follow controller does, and
 on a clear day in July it works perfectly well.
 
-Its failures are all failures of *timing*, and M1 gives it three new ways to fail
-that the M0 placeholder could not express:
+Its failures are all failures of *timing*:
 
-    it calcines whenever the sun is out, so it burns through sorbent cycles and
-    permanently destroys capture capacity for methane it did not need to make today
+    it calcines whenever the sun is out, burning sorbent cycles for methane it
+    did not need to make today
 
-    it runs the contactor fans flat out, paying 453 kWh/tCO2 where 126 would have
-    done, because it cannot see that fan power goes as the cube of airflow
+    it runs the contactor fans flat out, paying 453 kWh/tCO2 where 126 would
+    have done, because fan power goes as the cube of airflow
 
-    it pushes the electrolyser to 100 % load whenever it can, giving up the
-    part-load efficiency peak at ~53 %
+    it pushes the electrolyser to 100 % load, giving up the part-load
+    efficiency peak at ~53 %
 
 None of those are visible to a controller that only asks "is there power right
-now?", and all three are things the planning layer should fix. The gap is the
-measurement this project exists to make.
+now?". The gap is what the planning layer is for.
 """
 
 from __future__ import annotations
@@ -51,9 +49,8 @@ class GreedyController(Controller):
         measurement: Mapping[str, Any],
         forecast: Any = None,
     ) -> Request:
-        # Ask for everything. The bus will shed whatever cannot be served, which
-        # is precisely the behaviour being demonstrated: the controller does no
-        # anticipation at all and leaves feasibility to the safety layer.
+        # Ask for everything; the bus sheds what cannot be served. No
+        # anticipation at all -- feasibility is left entirely to the safety layer.
         return Request(
             setpoints={key: 1.0 for key in CONTROLLABLE},
             enables={key: 1.0 for key in CONTROLLABLE},

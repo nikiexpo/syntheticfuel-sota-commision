@@ -1,16 +1,15 @@
 """Math that works on both numpy floats and CasADi symbolics.
 
 Every reduced-order model in `sfp.models` is written exactly once against this
-module. The same source is then used three ways:
+module. The same source is then used two ways:
 
-    simulator   numeric numpy, perturbed parameters, the "truth"
-    estimator   CasADi symbolics inside an MHE problem
-    controller  CasADi symbolics inside the NMPC / planner
+    simulator   numeric numpy, the "truth"
+    controller  CasADi symbolics inside the NMPC
 
 Writing the model twice is the classic way to get a digital twin that quietly
-disagrees with its own controller, so we do not do that.
+disagrees with its own controller.
 
-Two flavours of the non-smooth operators are provided:
+Two flavours of the non-smooth operators:
 
     fmax / fmin / clip          exact, kinked   -- fine for the simulator
     smooth_max / smooth_min     C-infinity      -- for anything an NLP differentiates
@@ -79,12 +78,9 @@ def power(x, p):
 
 
 # --- non-smooth limiters (exact) ------------------------------------------
-# These three are the hottest functions in the whole project: a one-day
-# simulation calls them several million times. They therefore test the operand
-# types directly rather than going through `any_sym`, which builds a generator
-# and calls `any()` on every invocation -- that indirection alone accounted for
-# roughly a quarter of total runtime before it was removed. Behaviour is
-# identical; only the dispatch is cheaper.
+# The hottest functions in the project -- a one-day simulation calls them
+# several million times -- so they test operand types directly instead of going
+# through `any_sym`, whose generator cost about a quarter of total runtime.
 def fmax(a, b):
     if isinstance(a, _SYM_TYPES) or isinstance(b, _SYM_TYPES):
         return ca.fmax(a, b)

@@ -1,16 +1,16 @@
 """The subsystem interface every reduced-order model implements.
 
-One model, three consumers. A `Subsystem` is written once against `sfp.models.mathx`
-and is then evaluated numerically by the truth simulator and symbolically by the
-estimator and the controller. That is the whole point: a digital twin whose
-controller silently disagrees with the plant is a demo, not a control system.
+One model, two consumers. A `Subsystem` is written once against
+`sfp.models.mathx` and then evaluated numerically by the truth simulator and
+symbolically by the controller. A digital twin whose controller silently
+disagrees with the plant is a demo, not a control system.
 
 Conventions
 -----------
-states      SI, ordered, named. `rhs` returns dx/dt in state units per second.
-inputs      the manipulated variables the controller may set.
-disturbances the exogenous signals (weather, upstream flows) the controller cannot set.
-outputs     everything else worth logging: powers, flows, temperatures, rates.
+states       SI, ordered, named. `rhs` returns dx/dt in state units per second.
+inputs       the manipulated variables the controller may set.
+disturbances exogenous signals (weather, upstream flows) it cannot set.
+outputs      everything else worth logging: powers, flows, temperatures, rates.
 
 A subsystem with no states (a purely algebraic block such as the PV array) is
 legal: `states` is empty, `rhs` returns an empty vector, and only `outputs` does
@@ -122,11 +122,10 @@ class Subsystem(ABC):
     def requires(self) -> tuple[str, ...]:
         """Coupling keys this subsystem's `outputs` reads out of `w`.
 
-        Declared so `Plant` can verify at construction that they are produced by
-        an earlier subsystem or by the weather. Without that check a typo or a
-        reordering silently yields `w.get(key, 0.0)` -- a zero rate that looks
-        like a plant which simply chose not to run, which is close to the worst
-        possible failure mode for this project.
+        Declared so `Plant` can verify at construction that an earlier subsystem
+        or the weather produces them. Without that check a typo silently yields
+        `w.get(key, 0.0)` -- a zero rate indistinguishable from a plant that
+        chose not to run.
         """
         return ()
 
@@ -211,11 +210,10 @@ class Subsystem(ABC):
     ) -> float:
         """Largest setpoint whose draw fits inside `power_W`.
 
-        Bisection rather than an analytic inverse: draw is monotonically
-        non-decreasing in setpoint for every subsystem here, but the shape varies
-        (cubic for a fan, linear for a heater, polarisation-curve for a stack,
-        and flat for the Sabatier reactor). Bisection handles all of them, and
-        returns 0 when even the parasitic floor cannot be met.
+        Bisection rather than an analytic inverse: draw is monotone in setpoint
+        everywhere, but the shape varies (cubic fan, linear heater,
+        polarisation curve, flat reactor). Returns 0 if even the parasitic
+        floor cannot be met.
         """
         if enable < 0.5 or self.n_inputs < 2:
             return 0.0

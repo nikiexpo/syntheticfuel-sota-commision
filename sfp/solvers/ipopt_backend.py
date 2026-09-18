@@ -1,9 +1,8 @@
 """IPOPT through CasADi -- the reference backend.
 
-This is the backend everything is developed against, and at M7 it becomes the
-control in the experiment: the custom NLP solver is compared against it on
-identical instances for iterations, wall time, KKT residual and objective
-agreement. Keeping it plain matters more than making it fast.
+The backend everything is developed against, and the control against which any
+other backend is compared on identical instances -- iterations, wall time, KKT
+residual, objective agreement. Plain matters more than fast.
 
 Two settings are deliberate rather than inherited defaults:
 
@@ -47,19 +46,16 @@ class IpoptBackend(SolverBackend):
         warm_start: bool = False,
         #: Convert the problem to CasADi's scalar (SX) graph before solving.
         #:
-        #: An MX graph is evaluated node by node through CasADi's interpreter
-        #: with matrix-valued operations; SX is scalar-level and lets CasADi
-        #: optimise the expression and its derivatives properly. Measured on the
-        #: inner filter, ten busy states: **1.211 s -> 0.506 s per solve** at
-        #: identical iteration counts, with the resulting control identical to
-        #: 3e-16. The whole saving is evaluation speed, not convergence.
+        #: MX is evaluated node by node through CasADi's interpreter on
+        #: matrix-valued operations; SX is scalar-level and lets CasADi optimise
+        #: the expression and its derivatives properly. Measured on the inner
+        #: filter over ten busy states: **1.211 s -> 0.506 s per solve** at
+        #: identical iteration counts, control identical to 3e-16. The saving is
+        #: evaluation speed, not convergence.
         #:
-        #: It is not free at construction -- expansion costs 0.307 s against
-        #: 0.033 s for MX, paid on every build -- and the memory it needs grows
-        #: with the graph, so a very large problem can expand badly or not at
-        #: all. That is why `EconomicPlanner` opts out: its 240-step horizon is
-        #: two orders larger than the inner NMPC's and the trade has not been
-        #: measured there.
+        #: Not free at construction -- 0.307 s to expand against 0.033 s for MX,
+        #: on every build -- and memory grows with the graph, so a very large
+        #: problem can expand badly. `EconomicPlanner` opts out for that reason.
         expand: bool = True,
         linear_solver: str | None = None,
         **options,

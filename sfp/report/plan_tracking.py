@@ -1,36 +1,31 @@
 """How faithfully the plant follows the dispatch layer's plan.
 
-This exists to answer one question, and the answer decides what a parameter
-sweep is allowed to be made of.
+Sweeping profitability across battery sizes, prices, sites and seasons is
+affordable on *plans* -- a 240 h LP costs well under a second -- and not on
+closed-loop simulations, which cost minutes to hours each. Substituting plans is
+only legitimate if the plan predicts the plant faithfully, and "faithful" is a
+number, not an assertion. (Measured here, it is not: see
+`experiments/BATTERY_SIZING.md`.)
 
-Sweeping profitability across battery sizes, methane prices, sites and seasons
-is affordable on *plans* -- a 240 h LP costs well under a second -- and is not
-affordable on closed-loop simulations, which cost minutes to hours each. Using
-plans as a stand-in is only legitimate if the plan is a faithful predictor of
-what the plant actually does, and "faithful" is a number, not an assertion.
+Two errors, answering different questions:
 
-Two errors, answering different questions
------------------------------------------
-**Physical divergence.** Where the buffers actually are against where the plan
-said they would be, normalised by each buffer's own capacity. This is the LP's
-linearised model measured against the real plant.
+**Physical divergence.** Where the buffers are against where the plan said they
+would be, normalised by each buffer's capacity -- the linearised model against
+the real plant.
 
 **Profit error.** Realised minus predicted operating profit over the same
-window. This is the one a sweep rests on, and it is *not* implied by the first:
-inventories can drift a long way while the economics still land, and a small
-drift caused by a mis-timed commitment can cost real money.
+window, and *not* implied by the first: inventories can drift a long way while
+the economics land, and a small drift from a mis-timed commitment can cost real
+money.
 
-What is compared
-----------------
-Only the marginal terms the dispatch layer actually optimises -- methane
-revenue, battery wear, sorbent deactivation, water, and start-ups. Capital is
-sunk and appears in neither. The realised side is reconstructed from the plant's
-own logged states, so it is what happened, not what any controller believed.
+Only the marginal terms the dispatch layer optimises are compared -- methane
+revenue, battery wear, sorbent deactivation, water, start-ups. Capital is sunk
+and appears in neither. The realised side is reconstructed from the plant's own
+logged states.
 
-A caveat worth carrying into the write-up: the planned figure covers the window
-the *superseded* plan was responsible for, which is the replan interval, not the
-plan's whole horizon. A plan is only ever accountable for the part of itself
-that was implemented.
+The planned figure covers the window the *superseded* plan was responsible for,
+which is the replan interval, not the plan's whole horizon: a plan is only
+accountable for the part of itself that was implemented.
 """
 
 from __future__ import annotations

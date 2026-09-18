@@ -1,39 +1,31 @@
 """Electrically heated calciner: CaCO3 -> CaO + CO2 at ~900 degC.
 
-The plant's largest flexible load, and the source of its hardest scheduling
-decision.
+The plant's largest flexible load and its hardest scheduling decision, for two
+reasons:
 
-Why this subsystem drives the architecture
-------------------------------------------
 1. **A sharp thermodynamic threshold.** The reaction proceeds only while the
-   equilibrium CO2 pressure exceeds the kiln's operating pressure. Baker's
-   correlation gives
+   equilibrium CO2 pressure exceeds the kiln's operating pressure. Baker (1962):
 
        p_eq(T) = 4.137e7 * exp(-20474/T)   [atm]
 
-   which is 1 atm at 1170 K -- the textbook 897 degC. Running the kiln at 0.3 atm
-   (steam sweep or vacuum) drops the threshold to about 1092 K (819 degC). Below
-   that, heating the kiln produces *nothing*: there is no partial credit.
+   1 atm at 1170 K (the textbook 897 degC); at 0.3 atm the threshold drops to
+   ~1092 K. Below it, heating the kiln produces *nothing* -- no partial credit.
 
-2. **Enormous thermal inertia.** ~3 MJ/K of refractory means a cold start costs
-   772 kWh and takes 5.15 h at rated power, with the first CO2 appearing only
-   after 4.9 h. You cannot chase a cloud with this machine.
+2. **Enormous thermal inertia.** ~3 MJ/K of refractory: a cold start costs
+   772 kWh and 5.15 h at rated power, first CO2 after 4.9 h. This machine
+   cannot chase a cloud.
 
-Together those make "run the kiln today?" a unit-commitment problem, not a
-setpoint choice -- and the overnight question turns out to be a dead heat
-(all figures verified against the model, not estimated):
+So "run the kiln today?" is a unit-commitment problem, and the overnight
+question is a dead heat (both figures from the model):
 
     hold at 900 degC for 12 h   180 kWh of standing loss
-    let it drift and reheat     178 kWh  (it falls only to 697 degC; C/UA = 49 h)
+    let it drift and reheat     178 kWh  (falls only to 697 degC; C/UA = 49 h)
 
-Two kWh apart. There is no rule of thumb that resolves that, and it is exactly
-why a planner earns its keep here: which one wins depends on ambient temperature,
-on wind, on how long the gap really is, and on whether there will be sun to
-reheat with -- none of which a local rule can know.
+Which one wins depends on ambient temperature, wind, the length of the gap and
+whether there is sun to reheat with -- none of which a local rule can know.
 
-The kiln is deliberately oversized (150 kW against a ~70 kW steady demand). That
-headroom is the charging power of the chemical battery: it is how midday surplus
-gets banked as CO2 instead of being curtailed.
+The kiln is deliberately oversized (150 kW against ~70 kW steady demand). That
+headroom is the charging power of the chemical battery.
 """
 
 from __future__ import annotations
@@ -96,13 +88,11 @@ class Calciner(Subsystem):
     def overtemperature_interlock(self, temperature_K):
         """Hard-wired heater cutout as the refractory limit is approached.
 
-        This is a layer-4 interlock, not a control action: every real kiln has
-        one, and no optimiser is allowed to override it. It matters here because
-        the energy balance genuinely runs away without it -- at full heater duty
-        the throughput limit caps the endothermic heat sink at ~0.45 mol/s, and
-        the steady-state temperature would settle near 1357 K, well past the
-        refractory limit. The NMPC will carry T <= T_max as a hard constraint;
-        this is what happens if it fails anyway.
+        An interlock, not a control action: no optimiser may override it. The
+        energy balance genuinely runs away without it -- the throughput limit
+        caps the endothermic sink at ~0.45 mol/s, so steady state would settle
+        near 1357 K, past the refractory limit. The NMPC carries T <= T_max as
+        a hard constraint; this is what happens if it fails anyway.
         """
         return mx.smooth_step(self.p.temperature_max_K - temperature_K, width=5.0)
 

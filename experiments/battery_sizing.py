@@ -1,10 +1,10 @@
 """Experiment A: closed-loop battery sizing, and what the safety layer does.
 
-Why this replaces the plan-based grids in `experiments_old/`
-------------------------------------------------------------
-Those grids evaluated 240 h dispatch plans instead of simulations, on the
-strength of a measured plan-versus-realised bias of -0.8 % at three days. Two
-things later broke that licence:
+Why the sweeps are closed-loop
+------------------------------
+An earlier generation of grids scored 240 h dispatch plans instead of
+simulations, on the strength of a measured plan-versus-realised bias of -0.8 %
+at three days. Two things broke that licence:
 
 * Re-measured after the battery economics were corrected, the bias is **-34 %
   at three days and -11.7 % at seven** -- not -0.8 %.
@@ -20,7 +20,7 @@ things later broke that licence:
 
   A bias that varies by 51 points along the axis does not cancel in an ordering.
   It *tilts* the surface, and it inverted the conclusion: the plan-based grids
-  found the optimum at the smallest pack, and the correction runs the other way.
+  put the optimum at the smallest pack; the correction runs the other way.
 
 The mechanism is the point of the experiment. The outer layer is an hourly
 optimiser; buffering demand lives below an hour; so it credits a small pack with
@@ -29,11 +29,11 @@ a sub-hourly inner layer can see that.
 
 What is fixed and what is swept
 -------------------------------
-**The controller's methane price is fixed at its tuned value** rather than swept.
-`methane_price_per_kg` is a control tuning parameter, not a market price -- the
-old grids set it to the swept price and so changed two things per cell: what the
-plant is worth, and how the controller behaves. With it fixed, production is
-fixed too, and the economics at any market price are arithmetic afterwards.
+**The controller's methane price is fixed at its tuned value** rather than
+swept. `methane_price_per_kg` is a control tuning parameter, not a market price:
+sweeping it changes two things per cell -- what the plant is worth and how the
+controller behaves. Fixed, production is fixed too, and the economics at any
+market price are arithmetic afterwards.
 
 Attribution
 -----------

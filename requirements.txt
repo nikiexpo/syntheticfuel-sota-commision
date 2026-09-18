@@ -1,7 +1,7 @@
 # Core numerics and symbolics
 numpy>=2.0
 scipy>=1.13
-casadi>=3.6          # symbolic ROMs, and IPOPT for the NMPC from M4
+casadi>=3.6          # symbolic ROMs, and IPOPT for the inner NMPC
 pandas>=2.2
 pyyaml>=6.0          # provenance-tagged parameter files
 

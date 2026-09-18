@@ -1,1 +1,1 @@
-"""Weather input, solar geometry and stochastic irradiance ensembles."""
+"""PVGIS weather input, solar geometry and forecast degradation."""

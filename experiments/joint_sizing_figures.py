@@ -279,8 +279,7 @@ def fig_b4(seasonal, plt):
             if i == 1:
                 ax.set_xlabel("battery, kWh")
     fig.colorbar(im, ax=axes, label="methane, kg/day", shrink=0.7)
-    fig.suptitle("B4 — One colour scale, four panels: winter is a different plant",
-                 fontweight="bold")
+    fig.suptitle("B4 — Seasonal shifts in methane production", fontweight="bold")
     fig.savefig(FIGURES / "B4_seasonal.png", dpi=150)
     plt.close(fig)
 

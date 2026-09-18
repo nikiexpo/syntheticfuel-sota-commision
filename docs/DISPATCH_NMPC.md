@@ -5,13 +5,9 @@ between them, and where the present implementation departs from the intended
 design. Subsystem models are not reproduced here; they are in
 `docs/ASSUMPTIONS.md` and the model modules.
 
-**Status.** §1–§2 describe the code as it stands. §3 and §4 are kept as the
-record of the *tracking* formulation and why it was wrong — that mode still
-exists and `HierarchicalController` still uses the economic one. §5 is the
-safety filter, which is built and is now the default for `dispatch-nmpc`. §6 is
-the change log and the performance story; §7 the measured behaviour.
-
-Nothing in `bookkeeping/` was used as a source.
+**Status.** This describes the accepted design as built and measured. §1 is the
+closed loop, §2 the outer MILP, §3 the inner safety filter, §4 where the solve
+time goes, §5 what a three-day run measured, §6 what is still open.
 
 ---
 
@@ -40,13 +36,13 @@ Information flowing **down**, per interval $k$ — the complete interface, one
 | --- | --- | --- |
 | $c_{j,k}\in\{0,1\}$ | `Band.committed` | machine $j$ energised over interval $k$ |
 | $\bar s_{j,k}$ | `Band.setpoint_max` | setpoint the plan intends, in plant units |
-| $d_{j,k}$ | `Band.dispatch` | the raw LP variable (W, or mol/s for the reactor) — **published, never read** |
-| $z^{\text{tgt}}_{N}$ | `plan.state_at(...)` | buffer levels the plan expects, for the four states in `TARGET_STATES` |
+| $d_{j,k}$ | `Band.dispatch` | the raw LP variable (W, or mol/s for the reactor) |
+| $P^{\text{ch/dis}}_k,\ \gamma_k$ | `plan.battery_W`, `plan.curtail` | the outer layer's own battery and curtailment schedule |
+| $z^{\text{tgt}}_{N}$ | `plan.state_at(...)` | buffer levels the plan expects, for the four states in `TARGET_STATES` — unused by the filter |
 | ~~$\lambda_k$~~ | `lambda_EUR_per_kWh` | dual on the outer bus balance — **dead, see §1.1** |
 
-Also published and unread: `plan.battery_W` and `plan.curtail`, the outer
-layer's own battery and curtailment schedule. Together with `Band.dispatch`
-these are the complete proposed action $\bar u_0$ that §5 requires.
+The setpoints, battery channels and curtailment fraction together are the
+complete proposed action $\bar u_0$ that §3 minimally edits.
 
 ### 1.1 The price coordination path is dead
 
@@ -54,31 +50,28 @@ The architecture was originally designed around **price coordination**: the
 outer layer publishes $\lambda$, the inner layer solves a local problem at that
 price. That path no longer exists.
 
-`nmpc.py:597` binds `price = prices[k]` and never reads it again. Neither
-objective branch uses it:
+`InnerNMPC.solve` binds `price = prices[k]` and never reads it again. The filter
+has no economics at all, so there is nothing for $\lambda$ to price.
 
-- **tracking** — no energy price by design;
-- **economic** — uses the *static* `economics.p.methane_price_per_kg` and the
-  battery wear cost, not $\lambda$.
-
-The economic branch lost $\lambda$ deliberately. Three pricing variants were
-tried and all were wrong: pricing process power double-counts against the
-enforced bus balance and becomes a standing bias toward curtailment; pricing the
-battery at the current $\lambda$ says charging is worthless at midday, exactly
-when the battery should be filling, because $\lambda$ is zero when the plant is
-already saturated and spilling. The resolution was to move all intertemporal
-value into the terminal term. That reasoning is sound — but nothing removed the
-plumbing afterwards.
+$\lambda$ was dropped deliberately, before the filter existed. Three pricing
+variants were tried and all were wrong: pricing process power double-counts
+against the enforced bus balance and becomes a standing bias toward
+curtailment; pricing the battery at the current $\lambda$ says charging is
+worthless at midday, exactly when the battery should be filling, because
+$\lambda$ is zero when the plant is already saturated and spilling. The
+resolution was to move all intertemporal value upward — and the filter took
+that to its conclusion by removing intertemporal value from this layer
+entirely. What was left behind is the plumbing.
 
 **Consequence.** Recovering $\lambda$ from a MILP requires fixing the integer
 columns and re-solving the continuous problem — a second LP solve on every
 replan — for a number nothing consumes. `solve_lp(..., duals=False)` and
-`EconomicDispatch(recover_duals=False)` are now the defaults; the price survives
-as a reported diagnostic and in the tests that check the LP is well-formed.
+`EconomicDispatch(recover_duals=False)` are the defaults; the price survives as
+a reported diagnostic and in the tests that check the LP is well-formed.
 
-The safety filter of §5 has no economics at all, so there is no route for
-$\lambda$ to re-enter. If price coordination is ever wanted again it belongs in
-a *third* mode, not in the filter.
+There is no route for $\lambda$ to re-enter the filter. If price coordination is
+wanted again it belongs in a separate mode. (`HierarchicalController`, the
+NLP-planner comparator, is where the price-coordinated formulation still lives.)
 
 Information flowing **up**: none. There is no feedback path from the inner layer
 to the outer one. Band violations, shed predictions and solver failures are
@@ -235,7 +228,7 @@ $$
 
 Start costs are €0.50 / €40 / €5 / €40 for contactor / calciner / electrolyser /
 reactor. $c_{\text{batt}}$ is `cost_per_efc_EUR()`, the term whose correction
-invalidated the old price tuning (§7).
+invalidated the old price tuning (§5.2).
 
 **Terminal value**, with $f =$ `terminal_value_fraction`, everything priced at
 the methane it would become:
@@ -273,175 +266,34 @@ be a pass-through.
 
 ---
 
-## 3. The tracking formulation (superseded)
+## 3. The inner problem: a predictive safety filter
 
-Kept as the record of what §4 diagnoses, and still reachable as
-`objective="tracking"`. The filter of §5 replaced it as the default.
+`objective="filter"`, the default for `dispatch-nmpc`. Horizon $T = 300$ s,
+$\Delta t = 60$ s, so $N = 5$ intervals. State $x\in\mathbb R^{16}$, control
+$u\in\mathbb R^{11}$ — a $(\text{setpoint}, \text{enable})$ pair for each of the
+four process machines, $(P^{\text{ch}}, P^{\text{dis}})$ for the battery, and
+one curtailment fraction.
 
-Horizon $T = 3600$ s, $\Delta t = 600$ s, so $N = 6$ intervals. State
-$x\in\mathbb R^{16}$, control $u\in\mathbb R^{11}$ — a
-$(\text{setpoint}, \text{enable})$ pair for each of the four process machines,
-$(P^{\text{ch}}, P^{\text{dis}})$ for the battery, and one curtailment fraction.
+It answers exactly one question: **what is the smallest edit to the proposed
+action that keeps the plant feasible?** It makes no economic decision, and it
+decides nothing about the tail — steps $1{:}N$ exist only to certify that a
+feasible continuation exists. Only $u_0$ is applied.
 
 ### Decision variables
 
 $$
 x_{0:N}\in\mathbb R^{16(N+1)},\qquad
 u_{0:N-1}\in\mathbb R^{11N},\qquad
-\sigma_k \in [0,\,10],\qquad
-\omega_{k,j}\in[0,\,1]
+\xi^\pm_k,\ \sigma_k,\ \omega_{k,j},\ \eta_{k,j}\in[0,\infty)
 $$
 
-$\sigma$ is predicted load shed (units of the power scale), $\omega$ the
-excursion above a soft band ceiling, one per capped column $j\in\mathcal C$.
-All variables are scaled to their own bounds.
-
-### Constraints
-
-$$
-\begin{aligned}
-&x_0 = \hat x && \text{(hard equality)}\\
-&x_{k+1} = f(x_k, u_k, w_k) && \text{(hard equality)}\\
-&g_{\text{bus}}(x_k,u_k)/P_{\text{scale}} - \sigma_k = 0 && \text{(hard equality, slacked)}\\
-&u_{k,j} - \bar s_j - \omega_{k,j} \le 0,\quad j\in\mathcal C && \text{(soft ceiling)}\\
-&|u_{k,j} - u_{k-1,j}| \le \rho = 0.34,\quad j\in\mathcal M && \textbf{(hard)}\\
-&x^{\text{lo}} \le x_k \le x^{\text{hi}} && \textbf{(hard box)}\\
-&u^{\text{lo}} \le u_k \le u^{\text{hi}} && \text{(hard box)}
-\end{aligned}
-$$
+$\sigma$ is predicted load shed (units of the power scale), $\xi^\pm$ the
+two-sided state-box excursion, $\omega$ the excursion above a band ceiling, and
+$\eta$ the slew-limit excursion. All variables are scaled to their own bounds.
 
 Commitment enters as a **bound, not a variable**: $c_{j,k}=1$ pins the enable
 column to 1, $c_{j,k}=0$ pins both enable and setpoint to 0. The enable is never
-a free variable, which removes four near-discontinuous gates per interval.
-
-$\mathcal M$ (rate-limited columns) is every column that is not an enable and is
-not pinned. $\mathcal C$ (capped columns) is the setpoint column of every
-committed machine.
-
-### Objective (tracking mode)
-
-$$
-\max_{x,u,\sigma,\omega}\;
--\underbrace{w_u\sum_{k=0}^{N-1}\sum_{j\in\mathcal T}\big(u_{k,j}-\bar s_j\big)^2}_{\text{setpoint tracking}}
--\underbrace{w_\omega\sum_{k,j}\omega_{k,j}}_{\text{band excursion}}
--\underbrace{w_\sigma\sum_k \sigma_k}_{\text{shed}}
--\underbrace{w_T\sum_{i\in\mathcal I}\Big(\tfrac{x_{N,i}-z^{\text{tgt}}_i}{\chi_i}\Big)^2}_{\text{terminal inventory}}
-$$
-
-with $w_u = 1$, $w_\omega = 10^2$, $w_\sigma = 10^4$, $w_T = 100$.
-
-$\mathcal T$ is the setpoint column of each committed machine. **Battery and
-curtailment are deliberately untracked** — they are the balancing degrees of
-freedom that close the bus against weather the outer layer forecast an hour ago.
-
-Only $u_0$ is applied; the rest of the horizon is discarded.
-
----
-
-## 4. Why §3 was not a safety filter
-
-Every defect below is fixed in §5; this section is the diagnosis that produced
-that design, kept because the reasoning is what justifies the choices.
-
-A safety filter answers one question: *what is the smallest edit to the proposed
-action that keeps the plant feasible?* Six properties of the formulation above
-are inconsistent with that, in rough order of severity.
-
-### 4.1 The slack variables are bounded, so "soft" constraints are still hard
-
-$$\sigma_k \in [0,\,10], \qquad \omega_{k,j}\in[0,\,1]$$
-
-A slack with a finite upper bound does not soften a constraint — it relocates
-the infeasibility. If the required band excursion exceeds one scaled unit, or
-the required shed exceeds ten power-scale units, the problem is infeasible
-exactly as it was before the slack was added.
-
-This is the most likely cause of the 22 `Infeasible_Problem_Detected` and 3
-`Restoration_Failed` results in the 3-day run. A true soft constraint has
-$\sigma,\omega \in [0,\infty)$.
-
-### 4.2 The state box is hard
-
-$x^{\text{lo}} \le x_k \le x^{\text{hi}}$ is imposed as a hard box on every
-state at every step, on top of a hard initial-state equality and hard dynamics.
-If the current state plus the model implies a bound crossing that **no
-admissible control can prevent**, the problem is infeasible and the filter
-returns nothing — precisely when a safety filter is most needed.
-
-The SoC floor at night is the obvious instance: committed machines draw
-mandatory idle load, and the only remaining freedom is a battery that is already
-at its floor.
-
-A safety filter must never be infeasible. State constraints belong in the
-objective with a large penalty, not in the feasible set.
-
-### 4.3 The rate limit is hard, and applied to actuators that have no slew limit
-
-$|u_{k,j}-u_{k-1,j}|\le 0.34$ is applied to **every** movable non-enable column
-— which includes the battery's charge and discharge columns and the PV
-curtailment fraction.
-
-Neither has a physical slew limit worth modelling. A battery converter responds
-in milliseconds; curtailment is a firing-angle change. Rate-limiting them to 34 %
-of span per 10-minute interval is an artificial constraint on **the two channels
-whose entire purpose is to close the bus balance in real time.**
-
-This is self-inflicted and probably the second-largest source of trouble: the
-bus balance needs a shed slack largely because the fast channels that would
-otherwise absorb the imbalance have been slew-limited into uselessness.
-
-The rate limit is meaningful for the four process setpoints, which stand in for
-valves and heaters the plant model does not represent. It should be restricted
-to those columns, and even there it should be soft.
-
-### 4.4 The terminal economic term dominates the tracking term by 100×
-
-$w_T = 100$ against $w_u = 1$. The terminal inventory penalty is applied in
-tracking mode (`_terminal_value` returns a non-zero value whenever `targets` is
-supplied, regardless of mode).
-
-So the inner layer is not minimally editing the plan — it is **re-optimising the
-plant toward inventory targets at a hundred times the weight it places on
-following the plan's setpoints.** That is a second economic optimiser, running
-on a one-hour horizon, overriding decisions the 240-hour layer already made with
-far better information.
-
-The docstring's justification — that without a terminal term the layer drains
-every buffer inside its own hour — is a real problem, but it is a symptom of
-tracking the whole horizon rather than filtering the first action. A filter that
-penalises only $u_0$ has no incentive to drain anything, because it is not
-optimising the tail at all.
-
-### 4.5 The tracking target is the constraint boundary
-
-`Band.setpoint` returns `setpoint_max`, and `setpoint_max` is set to exactly the
-setpoint the LP intends (`dispatch.py:660`). So $\bar s_j$ is simultaneously:
-
-- the value the objective asks the NMPC to hit, and
-- the ceiling above which the band penalty $w_\omega$ applies.
-
-The reference sits **on** the constraint. Any positive tracking error is
-immediately penalised at $10^2$; any negative error at $1$. The "band" has no
-width — it is a point target with a one-sided penalty, not the power band the
-architecture called for.
-
-`Band.dispatch`, documented as "what the plan itself intended", is carried
-through the interface and **never read by anything**.
-
-### 4.6 The tracking sum runs over the whole horizon
-
-$\sum_{k=0}^{N-1}$ penalises deviation at every step, which makes this a tracking
-MPC. A filter penalises $\|u_0 - \bar u_0\|$ only, and uses steps $1{:}N$ purely
-to certify that a feasible continuation exists.
-
----
-
-## 5. The safety filter, as built
-
-**Implemented** as `objective="filter"`, and the default for `dispatch-nmpc`.
-Same variables, same dynamics, same commitment-as-a-bound treatment. Four
-changes from §3: unbounded slacks, soft state constraints, first-action-only
-objective, and no economics.
+free, which removes four near-discontinuous gates per interval.
 
 ### Constraints
 
@@ -457,12 +309,25 @@ $$
 \end{aligned}
 $$
 
-with $\mathcal M'$ = **process setpoint columns only** — battery and curtailment
-removed.
+$\mathcal C$ (capped columns) is the setpoint column of every committed machine.
+$\mathcal M'$ (rate-limited columns) is the **process setpoint columns only**.
+Battery and curtailment are excluded: neither has a physical slew limit worth
+modelling — a converter responds in milliseconds, curtailment is a firing-angle
+change — and they are precisely the two channels whose purpose is to close the
+bus balance in real time, so limiting them manufactures the imbalance $\sigma$
+then has to absorb.
 
-Every inequality that can conflict with another now has an unbounded slack, so
-**the problem is feasible by construction.** A safety filter that can fail to
-return an answer is not a safety filter.
+Three things are hard, and each for a physical reason: the initial state is
+measured, the dynamics *are* the model, and the actuator range is a range. Every
+inequality that can conflict with another carries an **unbounded** slack, so
+**the problem is feasible by construction.** This matters more than it sounds: a
+slack with a finite upper bound does not soften a constraint, it relocates the
+infeasibility, and a safety filter that can fail to return an answer is not a
+safety filter. The state box is the sharpest case — a hard box on top of hard
+dynamics and a hard initial state is infeasible whenever the state and the model
+imply a crossing no admissible control can prevent (a flat battery at night
+against the SoC floor, with committed machines drawing mandatory idle load),
+which is exactly when the filter is most needed.
 
 ### Objective
 
@@ -479,16 +344,20 @@ $$
 $$
 
 **$\bar u_0$ is the outer layer's complete proposed action** — all eleven
-columns, including battery and curtailment, taken from `Band.dispatch`,
-`plan.battery_W` and `plan.curtail`. Those three are already published and
-currently unused.
+columns, including battery and curtailment, from `Band.setpoint_max`,
+`plan.battery_W` and `plan.curtail`. A channel left out of the reference is a
+channel the inner layer is re-deciding rather than filtering.
 
-$W$ weights the columns by how much a unit edit matters; a diagonal of ones in
-scaled units is the right starting point.
+$W$ is a diagonal of ones in scaled units, so a full-span edit on one column
+costs 1. That is what makes the penalty weights below absolute rather than
+relative.
 
-**No terminal term and no economics.** The tail exists only to prove a feasible
-continuation exists. $\epsilon$ is small (≈$10^{-3}$) and present solely to keep
-the tail well-posed — it must not be large enough to shape $u_0$.
+**No terminal term and no economics.** A terminal inventory penalty is an
+economic objective — a second optimiser on a five-minute horizon, overriding the
+240-hour layer that has far better information. A filter that penalises only
+$u_0$ has no incentive to drain a buffer, because it is not optimising the tail.
+$\epsilon \approx 10^{-3}$ exists solely to keep the tail well-posed and must
+not be large enough to shape $u_0$.
 
 ### Weight ordering
 
@@ -502,21 +371,7 @@ Ordering rationale: exceeding a plan band or a slew limit is a nuisance; leaving
 a state box is a safety matter; failing to supply the bus is the thing the whole
 layer exists to prevent.
 
-### Band width
-
-The outer layer should publish a genuine band. Either:
-
-- **(a)** keep `setpoint_max` as a ceiling with headroom above the intended
-  dispatch — $\bar s_j = (1+\alpha)\,d_j$ for some margin $\alpha$ — and track
-  `dispatch`; or
-- **(b)** publish $[\underline s_j, \overline s_j]$ explicitly and track the
-  midpoint.
-
-Either fixes §4.5. (a) is the smaller change and matches the original intent
-that the outer layer sets *the maximum power demandable*, leaving the inner
-layer free to modulate beneath it. **Not yet done** — §4.5 still stands.
-
-### 5.1 Three details found by measurement
+### 3.1 Three details found by measurement
 
 **Slacks are floored at 1e-8, not 0** (`SLACK_FLOOR`). IPOPT relaxes every bound
 by `bound_relax_factor * max(1, |bound|)`, default 1e-8, so a slack declared
@@ -536,12 +391,13 @@ of weeks. Excluded states keep their *hard* box, so this removes a slack that
 can never be needed rather than a constraint. Worth 66 of 360 columns; measured
 at 1.8 % of solve time, which is the honest size of it.
 
-**Horizon 5 min, dt 60 s** (was 1 h / 600 s). dt now matches the simulator's own
-integration step, so the dynamics constraint and the plant agree by
-construction. Against 1 h / 600 s on identical busy states: **half the
+**Horizon 5 min, dt 60 s.** dt matches the simulator's own integration step, so
+the dynamics constraint and the plant agree by construction rather than by
+approximation. Against 1 h / 600 s on identical busy states: **half the
 iterations, 2.4× faster, a smaller problem, and the same action to within 1 %**
-on the edit term. Dropping the horizon is only defensible in filter mode — there
-is no terminal term whose placement depends on it.
+on the edit term. A horizon this short is only defensible for a filter — there
+is no terminal term whose placement depends on it, and the tail is a feasibility
+certificate rather than a plan.
 
 One caveat carried in `dispatch_nmpc.py`: `rate_limit` is a single per-interval
 number, but the k = 0 row spans `resolve_interval_s` (600 s) while k > 0 rows
@@ -551,52 +407,31 @@ express slew per second and scale each row by its own gap.
 
 ---
 
-## 6. Change log
-
-| # | change | status |
-| --- | --- | --- |
-| 1 | slack upper bounds to infinity | done |
-| 2 | state box soft, with two-sided slacks | done |
-| 3 | rate limit on process setpoints only, and soft | done |
-| 4 | drop terminal term in filter mode | done |
-| 5 | objective becomes the first-action edit plus penalties | done |
-| 6 | reference is all 11 columns from the plan | done |
-| 7 | band ceiling gets width above `dispatch` | **not done** — §4.5 stands |
-| 8 | remove the dead `prices` argument | not done — §1.1 |
-| 9 | dual recovery optional, off by default | done |
-| 10 | slack floor at 1e-8 | done — §5.1 |
-| 11 | trim soft box on slow states | done — §5.1 |
-| 12 | horizon 5 min, dt 60 s | done — §5.1 |
-| 13 | SX expansion in the IPOPT backend | done — §6.1 |
-
-### 6.1 Where the time went
-
-An earlier draft of this section concluded **"the filter is slower"**, on the
-grounds that it is a larger NLP than the tracking formulation. That was measured
-correctly and reasoned about wrongly: the extra columns were never the cost.
+## 4. Where the solve time goes
 
 Cumulative, on ten identical fully-committed states:
 
-| | s/solve | iterations |
+| configuration | s/solve | iterations |
 | --- | ---: | ---: |
-| tracking formulation, 1 h / 600 s | 2.744 | 49.6 |
-| filter at 5 min / 60 s | 1.217 | 24.8 |
-| + slack trim (§5.1) | 1.195 | 25.3 |
+| 1 h / 600 s | 2.744 | 49.6 |
+| 5 min / 60 s | 1.217 | 24.8 |
+| + slack trim (§3.1) | 1.195 | 25.3 |
 | + `expand=True` | **0.511** | 25.3 |
 
 **5.4× faster.** The finer dt halved the iterations; SX expansion cut the cost of
-each one by 2.4×.
+each one by 2.4×. (The first row was measured under the superseded objective, so
+it is a configuration baseline rather than an objective-for-objective
+comparison; the second row onward are all the filter.)
 
 `expand=True` converts the problem from CasADi's MX graph — walked node by node
 through an interpreter, with matrix-valued operations — to a scalar SX graph
 that CasADi can optimise properly. Same iteration count, control identical to
 3e-16, and since construction is *inside* the measured solve the solving itself
-went from 1.227 s to 0.211 s, a **5.8×**. It is the single largest win in this
-document and it is one option. `EconomicPlanner` opts out: its 240-step horizon
-is two orders larger and the trade has not been measured there.
+went from 1.227 s to 0.211 s, a **5.8×**. It is the single largest win here and
+it is one option. `EconomicPlanner` opts out: its 240-step horizon is two orders
+larger and the trade has not been measured there.
 
-Two things that measurement refuted along the way, recorded so they are not
-retried:
+Two things measurement refuted, recorded so they are not retried:
 
 * **Removing variables does not help.** The slack trim removed 18 % of the
   columns for 1.8 % of the time. Cost tracks the number of times the plant model
@@ -618,11 +453,11 @@ retried:
 baked into the expression graph as numeric constants, so the one-entry cache in
 `IpoptBackend._solver_for` never hits. Making weather, the initial state and the
 reference action CasADi *parameters* would let one solver be built and reused,
-and is worth roughly another 2×. (An earlier version of this section dismissed
-caching on the grounds that construction was 45 ms — true for MX, and no longer
-true.)
+and is worth roughly another 2×.
 
-## 7. Measured behaviour
+---
+
+## 5. Measured behaviour
 
 **3 days, Seville, reference sizing, €5.50/kg, seed 0.** Both controllers on the
 identical window, so the comparison is like-for-like.
@@ -643,18 +478,18 @@ identical window, so the comparison is like-for-like.
 | limiting subsystem | reactor capacity | solar |
 | wall time | 98 s | 251 s |
 
-**Zero solver failures over three days** — the first long-window verification
-this layer has passed. Every earlier attempt looked healthy on a short window
-and fell apart at three days: the tracking formulation reported 98.6 % success
-at a quarter day and 78.2 % at three, with 22 infeasibilities.
+**Zero solver failures over three days.** A short window proves nothing here:
+earlier formulations reported 98.6 % success at a quarter day and 78.2 % at
+three days, with 22 infeasibilities, so three days is the shortest window worth
+quoting.
 
 The inner layer **eliminates bus trips and makes slightly more methane**. That
 is stronger than the architecture required — the expected trade was production
-for constraint satisfaction, and the tracking formulation did pay it (−2.8 %
-methane for 243 → 26 trips). A plant that never trips does not lose the
-production a trip costs.
+for constraint satisfaction, and earlier formulations did pay it (−2.8 % methane
+for 243 → 26 trips). A plant that never trips does not lose the production a
+trip costs.
 
-### 7.1 One thing that does not add up
+### 5.1 One thing that does not add up
 
 `nmpc_predicted_shed_kWh` reads **0.000, mean and max**, while the plant shed
 **1577 kWh**.
@@ -667,16 +502,52 @@ reduction is a side effect, not the mechanism working as designed. Either the
 disagrees with `bus.reconcile`. This is the largest open gap between what this
 layer claims and what it does.
 
-### 7.2 What these numbers supersede
+### 5.2 The controller's methane price
 
-Everything previously recorded for this layer was measured at
-`methane_price_per_kg = 3.00`, which was mis-tuned: that figure was chosen
-against a battery wear cost of €0.042/kWh, and correcting the battery economics
-raised it 35 % to €0.0565/kWh — across the ≈€0.043/kWh night-time shadow price —
-so the LP stopped cycling the battery and ran it flat, reproducing the failure
-mode documented at €1.80/kg. The default is now 5.50, above the corrected
-crossover with margin rather than at its edge.
+`methane_price_per_kg` is a **controller tuning parameter, not a market price**,
+and the default of €5.50 is set against the battery's wear cost. An earlier
+default of €3.00 was mis-tuned: it had been chosen against a wear cost of
+€0.042/kWh, and correcting the battery economics raised that 35 % to €0.0565/kWh
+— across the ≈€0.043/kWh night-time shadow price — so the LP stopped cycling the
+battery and ran it flat. €5.50 sits above the corrected crossover with margin.
 
-Consequently **methane and LCOM here are not comparable** to the four experiment
-reports in `experiments/`, or to the plan-fidelity figures, all of which are
-still at €3.00 and are due a re-run.
+Measured directly (`experiments/price_strategy.py`), the parameter is saturated
+above roughly €4: controllers at €4 and €8 differ by under 1 % on methane, EFC,
+curtailment and LCOM, with overlapping commitment traces. The threshold matters;
+the level above it does not.
+
+Numbers quoted above are at €5.50. The sizing experiments in `experiments/` run
+the controller at €6.00 and are internally consistent, so their methane and LCOM
+figures are not directly comparable with this table.
+
+---
+
+## 6. Open items
+
+**The band has no width.** `Band.setpoint_max` is set to exactly the setpoint the
+LP intends, and the reference $\bar u_0$ is read from the same field. So $\bar
+s_j$ is simultaneously the value the filter starts from and the ceiling above
+which $\rho_\omega$ applies: the reference sits *on* the constraint, and any
+upward edit is penalised at $10^3$ while any downward edit is free. The outer
+layer should publish a genuine band — either keep `setpoint_max` as a ceiling
+with headroom, $\bar s_j = (1+\alpha)\,d_j$, and reference `Band.dispatch`; or
+publish $[\underline s_j,\ \overline s_j]$ and reference the midpoint. The first
+is smaller and matches the intent that the outer layer sets the *maximum power
+demandable*, leaving the inner layer free to modulate beneath it.
+
+**The `prices` argument is dead.** §1.1. It is still threaded from
+`DispatchNMPCController` into `InnerNMPC.solve` and bound per interval.
+
+**`nmpc_predicted_shed_kWh` reads zero.** §5.1 — the largest gap between what
+this layer claims and what it does.
+
+**No information flows up.** §1. Band violations, shed predictions and solver
+failures are recorded as diagnostics and discarded; the outer layer never learns
+that its plan was infeasible.
+
+**The rate limit spans the wrong interval at $k = 0$.** §3.1.
+
+**The filter cannot decommit.** It can drive a setpoint to zero but cannot clear
+an enable the outer layer has pinned, so a committed machine keeps drawing idle
+load — up to 194 kWh/day at the smallest pack size measured. See
+`experiments/BATTERY_SIZING.md` §4.1.
