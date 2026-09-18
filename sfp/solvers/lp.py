@@ -146,15 +146,27 @@ class LPBuilder:
 
 
 def solve_lp(problem: LPProblem, *, time_limit_s: float = 120.0,
-             mip_gap: float = 1e-3) -> LPSolution:
+             mip_gap: float = 1e-3, duals: bool = False) -> LPSolution:
     """Solve with HiGHS. Returns duals under the marginal-value convention.
 
-    A mixed-integer problem is solved in two passes: branch and bound for the
-    schedule, then the integer columns are **fixed at their solved values and the
-    continuous relaxation re-solved** to recover duals. A MILP has no duals of
-    its own -- the value function is not convex -- so this is the standard way to
-    get a price out of one, and it is the price conditional on the commitment
-    actually chosen, which is the economically meaningful one.
+    A mixed-integer problem has no duals of its own -- the value function is not
+    convex -- so recovering a price from one takes **two passes**: branch and
+    bound for the schedule, then the integer columns fixed at their solved
+    values and the continuous relaxation re-solved. That price is the one
+    conditional on the commitment actually chosen, which is the economically
+    meaningful one.
+
+    **`duals` is off by default, because the second pass is pure cost unless
+    something reads the price.** Nothing in the control path does: the inner
+    NMPC takes `prices` and discards it in both objective modes, and the
+    proposed safety filter has no economics at all. Lambda survives only as a
+    reported diagnostic and in the tests that check the LP is well-formed. Turn
+    this on for a reporting run; leave it off for a sweep, where it would buy an
+    extra LP solve per replan and nothing else.
+
+    With `duals=False` a MIP returns a zero dual vector rather than a wrong one,
+    so a caller that reads `dual()` anyway gets an obviously-empty answer instead
+    of a plausible-looking stale number.
     """
     started = time.perf_counter()
 
@@ -164,12 +176,15 @@ def solve_lp(problem: LPProblem, *, time_limit_s: float = 120.0,
             return LPSolution(np.zeros(problem.n_x), float("nan"), False,
                               str(mip.message)[:80], time.perf_counter() - started,
                               np.zeros(problem.n_g), problem.blocks)
-        fixed = _with_integers_fixed(problem, np.asarray(mip.x, dtype=float))
-        res = _highs(fixed, time_limit_s)
-        # keep the MILP's own objective and point; the second solve exists only
-        # for its duals and can differ in the last digits
         x, fun = np.asarray(mip.x, dtype=float), float(mip.fun)
         ok = True
+        if duals:
+            fixed = _with_integers_fixed(problem, x)
+            res = _highs(fixed, time_limit_s)
+            # keep the MILP's own objective and point; the second solve exists
+            # only for its duals and can differ in the last digits
+        else:
+            res = None
     else:
         res = _highs(problem, time_limit_s)
         x = np.asarray(res.x, dtype=float) if res.x is not None else np.zeros(problem.n_x)
@@ -178,14 +193,15 @@ def solve_lp(problem: LPProblem, *, time_limit_s: float = 120.0,
 
     elapsed = time.perf_counter() - started
 
-    duals = np.zeros(problem.n_g)
+    y = np.zeros(problem.n_g)
     marg = getattr(getattr(res, "ineqlin", None), "marginals", None)
     if marg is not None and np.ndim(marg) == 1 and len(marg) == problem.n_g:
-        duals = np.asarray(marg, dtype=float)
+        y = np.asarray(marg, dtype=float)
 
     return LPSolution(
-        x=x, f=fun, success=ok, status=str(res.message)[:80],
-        wall_time_s=elapsed, _duals=duals, _blocks=problem.blocks,
+        x=x, f=fun, success=ok,
+        status="ok (duals skipped)" if res is None else str(res.message)[:80],
+        wall_time_s=elapsed, _duals=y, _blocks=problem.blocks,
     )
 
 

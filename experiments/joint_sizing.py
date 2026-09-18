@@ -1,49 +1,42 @@
-"""Experiment 4: the joint PV x battery sizing grid, Seville only.
+"""Experiment B: joint PV x battery sizing, closed loop, two sites.
 
-Experiments 1 and 2 each swept one design axis with the other pinned -- battery
-at 1100 kWp, PV at 500 kWh -- and `PV_SIZING.md` section 3 flagged the obvious
-hole: the two axes interact, because a larger array makes storage more useful
-and a larger store makes an oversized array less wasteful. Neither one-dimensional
-grid can locate a joint optimum that sits off its own line.
+Successor to the plan-based joint grid in `experiments_old/`, which is
+superseded for the reasons set out in `BATTERY_SIZING.md` §1: the outer LP's
+planned profit is flat across a 15x range of battery capacity while realised
+profit rises 2.5x, so a grid scored on plans measures a different shape from the
+one the plant has.
 
-This grid closes that. **Seville only**: the cloudy sites cost three times the
-solve budget to re-confirm a conclusion both of the earlier grids already
-returned for them (cheapest battery, and no cell that repays), and the
-interesting interaction -- curtailment at large arrays being recovered by
-storage -- is strongest where there is surplus to store.
+Design decisions, and why
+-------------------------
+**One controller price, EUR 6.00.** Measured directly (`price_strategy.py`): a
+controller at EUR 4 and one at EUR 8 differ by under 1 % on methane, EFC,
+curtailment and LCOM, with commitment traces that overlap exactly. The price is
+saturated across at least a 2x range, because the night-time shadow price of
+electricity scales with the product price -- raising one lifts both sides of the
+battery-wear comparison together, so the cycling decision does not move. There
+is a threshold below roughly EUR 4 where the optimiser stops cycling, but no
+slope above it. Sweeping the controller price would therefore have bought 36
+extra runs and no new behaviour.
 
-Axes
-----
-**PV** reuses experiment 2's five array sizes exactly, so every row has a
-directly comparable predecessor.
+**Capex is not simulated.** Capital cost never enters the controller's
+objective, verified in the earlier capex study where plans came back
+bit-identical at 2200 and 1100 EUR/kW. The four multipliers are exact arithmetic
+over these runs.
 
-**Battery** does not reuse experiment 1's. That grid ran 500-2500 kWh and found
-net profitability falling monotonically, optimum pinned at the smallest size
-tested and therefore *not located*. This axis runs 100-1500 kWh instead, so the
-optimum has somewhere to be. 500 and 1500 kWh are retained as grid lines because
-they are the two anchors the earlier experiments used.
+**`dispatch-nmpc` only.** `BATTERY_SIZING.md` §3.1 established that the outer
+layer alone is systematically wrong for sizing; re-running it here would double
+the cost to re-demonstrate a settled point.
 
-**Price** becomes the panel dimension rather than a grid axis. Experiment 2
-found the optimal array moving by a factor of three or four across the price
-range, so a single-price sizing grid would be answering a much narrower question
-than it appears to. Three panels at EUR 3.00, 4.50 and 6.00/kg.
-
-Cross-checks
-------------
-Two cells have known answers and must reproduce them:
-
-* (1100 kWp, 500 kWh) at EUR 3.00 and 6.00 -- against `pv_sizing.csv`
-* (1100 kWp, 1500 kWh) at EUR 3.00 and 6.00 -- against
-  `relative_profitability.csv`
-
-`--check` prints both comparisons against whatever this run produced. They
-should agree to the last decimal: same plant, same weather, same solver.
-
-Method is unchanged from experiments 1 and 2 -- 240 h dispatch plans rather than
-closed-loop simulations, four seasonal windows per cell, discounted payback at
-7 % with battery replacement bought when it falls due. See
-`RELATIVE_PROFITABILITY.md` sections 1 and 4 for the justification and the
-caveats, which carry over in full.
+**Two seasons, weighted.** Summer and winter only, combined as
+`0.63*summer + 0.37*winter`. A straight mean understates annual production by
+3-11 %, and -- the part that matters -- the understatement *grows with pack
+size*, tilting the grid by 7.3 points in the same direction as the error that
+inverted the old conclusions. The weighting zeroes the level error (+0.31 %) and
+leaves 6.2 points of residual tilt, which is an order of magnitude smaller than
+the 43-point spread it replaces but is **not zero**: it under-credits large
+packs, so any conclusion resting on a difference narrower than ~6 % is inside
+the noise. Weights were fitted on the four-season Seville data in
+`results/battery_sizing.csv`.
 """
 
 from __future__ import annotations
@@ -57,289 +50,156 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from _plotting import heatmap_panels  # noqa: E402
-from relative_profitability import (  # noqa: E402
-    C_RATE, SEASONS, SITES, _plan_profit_per_day, _weather,
-)
-from sfp.cli import REFERENCE_SIZING, build_plant  # noqa: E402
-from sfp.economics import Economics  # noqa: E402
-
 HERE = Path(__file__).resolve().parent
-FIGURES = HERE / "figures"
+sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE))
+
+from battery_sizing import _attribution, _commitment  # noqa: E402
+from sfp.cli import REFERENCE_SIZING, build_plant, controllers_for  # noqa: E402
+from sfp.economics import Economics  # noqa: E402
+from sfp.report.metrics import compute_metrics  # noqa: E402
+from sfp.sim.simulator import SimulationConfig, simulate  # noqa: E402
+from sfp.weather import pvgis  # noqa: E402
+from sfp.weather.series import Site, WeatherSeries  # noqa: E402
+
 RESULTS = HERE / "results"
+SERIES = RESULTS / "series"
 
-SITE_NAME = "Seville"
-
-#: Array sizes, kWp. Identical to experiment 2's axis.
-ARRAYS = np.array([300.0, 700.0, 1100.0, 1500.0, 1900.0])
-
-#: Capacities, kWh. Extends below experiment 1's floor so the optimum it could
-#: not locate has somewhere to land.
-BATTERIES = np.array([100.0, 250.0, 500.0, 1000.0, 1500.0])
-
-#: One panel per price. See the module docstring.
-PANEL_PRICES = np.array([3.0, 4.5, 6.0])
-
-#: Process-chain capital cost as a fraction of the assumed EUR 2200/kW. A
-#: near-term forward assumption rather than today's number: experiment 3 swept
-#: 0.25-1.00 and found that even a free process chain does not repay at
-#: EUR 3.00/kg, so a sizing grid run at 1.00 spends most of its cells in
-#: territory where nothing is viable and the optimum is hard to read.
-#:
-#: This is free to assume here. Capital cost never enters the controller's
-#: objective, so the multiplier moves the economics and not a single dispatch
-#: decision -- verified directly in experiment 3, where the plans came back
-#: bit-identical at 2200 and 1100 EUR/kW. It rescales the surface; it cannot
-#: move the optimum's location for a reason the physics does not support.
-PROCESS_CAPEX_MULTIPLIER = 0.75
-
-PLAN_HOURS = 240
+SITES = {
+    "Seville": Site(37.3891, -5.9845, 10.0, name="Seville, ES"),
+    "London": Site(51.5074, -0.1278, 11.0, name="London, UK"),
+}
+PV_KWP = (700.0, 1100.0, 1500.0)
+#: Reaches 2500 because the battery axis in experiment A still had net profit
+#: rising at 1500 kWh -- the optimum sat on the grid edge and was not located.
+BATTERIES = (500.0, 1500.0, 2500.0)
+SEASONS = {"summer": 172, "winter": 15}
+#: See the module docstring. Fitted on the four-season data, not assumed.
+SEASON_WEIGHT = {"summer": 0.63, "winter": 0.37}
+PRICE = 6.0
+C_RATE = 0.5
+DAYS = 7.0
 
 
-def run(quick: bool = False,
-        process_multiplier: float = PROCESS_CAPEX_MULTIPLIER) -> pd.DataFrame:
-    econ_base = Economics()
-    crf = econ_base.capital_recovery_factor()
-    fixed = float(econ_base.p.fixed_opex_fraction)
-    horizon = float(econ_base.p.project_lifetime_years)
-    discount = float(econ_base.p.discount_rate)
-    seasons = {"summer": SEASONS["summer"]} if quick else SEASONS
-    site = SITES[SITE_NAME]
+def one(site_name: str, site: Site, pv_kwp: float, battery_kwh: float,
+        season: str, days: float) -> dict:
+    frame = pvgis.load_weather(site.latitude, site.longitude, site.altitude)
+    day = SEASONS[season]
+    weather = WeatherSeries(pvgis.slice_days(frame, day, int(days) + 1), site)
+    plant = build_plant(pv_kwp, battery_kwh, battery_kwh * C_RATE,
+                        REFERENCE_SIZING["calciner_kw"])
+    econ = Economics()
+    econ.p.methane_price_per_kg = PRICE
+    config = SimulationConfig(days=days, start_day=day, dt_s=60.0,
+                              control_interval_s=300.0, seed=0,
+                              forecast_skill=0.75)
+    started = time.perf_counter()
+    result = simulate(plant, controllers_for(["dispatch-nmpc"])[0], weather,
+                      config, economics=econ)
+    log = result.log
+    m = compute_metrics(result, econ)
+    capex = econ.capex_full(plant)
 
-    rows = []
-    total = len(ARRAYS) * len(BATTERIES) * len(PANEL_PRICES) * len(seasons)
-    done = 0
-    started = time.time()
-    for kwp in ARRAYS:
-        for kwh in BATTERIES:
-            plant = build_plant(float(kwp), float(kwh), float(kwh * C_RATE),
-                                REFERENCE_SIZING["calciner_kw"])
-            capex = econ_base.capex_full(plant)
-            battery = plant["battery"]
-            # Only the process chain is discounted; the array and the pack are
-            # priced at today's numbers, which are already market-observed.
-            capex_total = (capex.pv + capex.battery
-                           + capex.process * process_multiplier)
-            first_pack_per_day = capex_total * (crf + fixed) / 365.0
-            opex_per_day = capex_total * fixed / 365.0
+    row: dict = {
+        "site": site_name, "pv_kwp": pv_kwp, "battery_kwh": battery_kwh,
+        "season": season, "weight": SEASON_WEIGHT[season], "days": days,
+        "price": PRICE,
+        "ch4_kg_per_day": m.ch4_kg_per_day, "lcom": m.lcom_eur_per_kg,
+        "curtail_frac": m.curtailment_fraction,
+        "night_share": m.night_production_fraction,
+        "efc_per_day": m.battery_efc / days, "soc_min": m.soc_min,
+        "soc_max": m.soc_max, "limiting": m.limiting_subsystem,
+        "bus_trips": m.bus_trips, "bus_interventions": m.bus_interventions,
+        "shed_kwh": m.shed_kwh, "unserved_kwh": m.unserved_kwh,
+        "utilisation": m.utilisation,
+        "operating_margin_eur": m.operating_margin_eur,
+        # kept separately so the capex multipliers can be applied to the
+        # process chain alone, which is the only part with a learning curve
+        "capex_eur": capex.total, "capex_pv_eur": capex.pv,
+        "capex_battery_eur": capex.battery, "capex_process_eur": capex.process,
+        "wall_s": time.perf_counter() - started,
+    }
+    for key in ("nmpc_used", "nmpc_failed", "nmpc_iterations",
+                "nmpc_solve_time_s", "nmpc_predicted_shed_kWh"):
+        if key in log:
+            v = log[key].dropna()
+            if len(v):
+                row[key] = float(v.mean())
+    row.update(_commitment(log, config.dt_s, days))
+    row.update(_attribution(log))
 
-            for price in PANEL_PRICES:
-                econ = Economics()
-                econ.p.methane_price_per_kg = float(price)
-                per_season, per_efc, per_stress = [], [], []
-                for season, day in seasons.items():
-                    weather = _weather(site, day)
-                    operating, _hours, efc, stress = _plan_profit_per_day(
-                        plant, econ, weather, site)
-                    per_season.append(operating)
-                    per_efc.append(efc)
-                    per_stress.append(stress)
-                    done += 1
-                    rate = (time.time() - started) / done
-                    print(f"  [{done:3d}/{total}] {kwp:6.0f} kWp "
-                          f"{kwh:6.0f} kWh  EUR {price:.2f}/kg  {season:7s} "
-                          f"-> operating EUR {operating:7.1f}/day  "
-                          f"{efc:.2f} EFC/day   "
-                          f"({rate:.1f} s/solve, "
-                          f"{(total - done) * rate / 60.0:.0f} min left)",
-                          flush=True)
-
-                operating = float(np.nanmean(per_season))
-                efc_day = float(np.nanmean(per_efc))
-                stress = float(np.nanmean(per_stress))
-
-                repl_pv = battery.uncharged_replacement_PV_EUR(
-                    project_years=horizon, discount_rate=discount,
-                    efc_per_year=efc_day * 365.0, mean_stress=stress,
-                )
-                life = battery.life_years(efc_day * 365.0, stress)
-
-                # Cash flow, not the annuity: capex whole at t = 0, fixed opex
-                # annual, the wear accrual added back so replacements can enter
-                # as lumps when the pack actually dies. Same treatment as
-                # experiments 1 and 2.
-                wear_per_day = battery.cost_per_efc_EUR() * efc_day
-                cash_per_day = operating + wear_per_day - opex_per_day
-
-                rows.append({
-                    "site": SITE_NAME,
-                    "pv_kwp": float(kwp),
-                    "battery_kwh": float(kwh),
-                    "price_EUR_per_kg": float(price),
-                    "operating_EUR_per_day": operating,
-                    "capital_EUR_per_day": first_pack_per_day
-                                           + repl_pv * crf / 365.0,
-                    "first_pack_EUR_per_day": first_pack_per_day,
-                    "replacement_EUR_per_day": repl_pv * crf / 365.0,
-                    "net_EUR_per_day": operating - first_pack_per_day
-                                       - repl_pv * crf / 365.0,
-                    "cash_EUR_per_day": cash_per_day,
-                    "payback_years": econ_base.discounted_payback_years(
-                        capex_total, cash_per_day * 365.0,
-                        replacement_EUR=battery.capex_EUR(),
-                        replacement_interval_years=life,
-                    ),
-                    "capex_EUR": capex_total,
-                    "capex_pv_EUR": capex.pv,
-                    "capex_battery_EUR": capex.battery,
-                    "capex_process_EUR": capex.process * process_multiplier,
-                    "capex_process_full_EUR": capex.process,
-                    "process_capex_multiplier": float(process_multiplier),
-                    "efc_per_day": efc_day,
-                    "dod_stress": stress,
-                    "battery_life_years": life,
-                    "seasons": len(per_season),
-                    "season_min": float(np.nanmin(per_season)),
-                    "season_max": float(np.nanmax(per_season)),
-                })
-    return pd.DataFrame(rows)
-
-
-def _grid(frame: pd.DataFrame, price: float, column: str) -> np.ndarray:
-    sub = frame[frame["price_EUR_per_kg"] == price]
-    return sub.pivot(index="pv_kwp", columns="battery_kwh",
-                     values=column).to_numpy()
-
-
-def plot(frame: pd.DataFrame) -> None:
-    from matplotlib.colors import TwoSlopeNorm
-
-    rows = [f"{a:.0f}" for a in ARRAYS]
-    cols = [f"{b:.0f}" for b in BATTERIES]
-    panels = [f"EUR {p:.2f}/kg" for p in PANEL_PRICES]
-    mult = float(frame["process_capex_multiplier"].iloc[0])
-    basis = (f"process capex at {mult:.2f}x of EUR 2200/kW"
-             if mult != 1.0 else "process capex at EUR 2200/kW")
-
-    nets = {name: _grid(frame, float(p), "net_EUR_per_day")
-            for name, p in zip(panels, PANEL_PRICES)}
-    best = {name: np.unravel_index(int(np.nanargmax(g)), g.shape)
-            for name, g in nets.items()}
-    lo = min(np.nanmin(g) for g in nets.values())
-    hi = max(np.nanmax(g) for g in nets.values())
-    heatmap_panels(
-        FIGURES / "joint_sizing_absolute.png", nets,
-        row_labels=rows, col_labels=cols,
-        title=f"Joint sizing at {SITE_NAME}: net profitability over PV array "
-              f"and battery capacity\n(dispatch plans, seasonally averaged; "
-              f"{basis})",
-        xlabel="battery capacity, kWh", ylabel="PV array, kWp",
-        cbar_label="net profitability, EUR/day "
-                   "(operating less annualised capital)",
-        cmap="RdYlGn", fmt=".0f",
-        norm=TwoSlopeNorm(vmin=lo, vcenter=0.0, vmax=hi) if lo < 0 < hi else None,
-        vmin=lo, vmax=hi, highlight=best,
-    )
-
-    horizon = float(Economics().p.project_lifetime_years)
-    paybacks = {name: _grid(frame, float(p), "payback_years")
-                for name, p in zip(panels, PANEL_PRICES)}
-    fastest = {}
-    for name, g in paybacks.items():
-        finite = np.isfinite(g)
-        if finite.any():
-            masked = np.where(finite, g, np.inf)
-            fastest[name] = np.unravel_index(int(np.argmin(masked)), g.shape)
-    heatmap_panels(
-        FIGURES / "joint_sizing_payback.png", paybacks,
-        row_labels=rows, col_labels=cols,
-        title=f"Joint sizing at {SITE_NAME}: time to break even\n"
-              f"(discounted at 7 %, battery replaced as it falls due; {basis})",
-        xlabel="battery capacity, kWh", ylabel="PV array, kWp",
-        cbar_label=f"discounted payback, years "
-                   f"(dark red = not repaid within {horizon:.0f} yr)",
-        cmap="viridis_r", fmt=".1f", vmin=0.0, vmax=horizon,
-        mask_invalid=True, highlight=fastest,
-    )
-
-    # Battery utilisation, which is what makes the interaction visible: the
-    # economics alone cannot distinguish a pack that is too small to help from
-    # one that is large enough but has no surplus to absorb.
-    heatmap_panels(
-        FIGURES / "joint_sizing_cycling.png",
-        {name: _grid(frame, float(p), "efc_per_day")
-         for name, p in zip(panels, PANEL_PRICES)},
-        row_labels=rows, col_labels=cols,
-        title=f"Joint sizing at {SITE_NAME}: how hard the plan works the pack",
-        xlabel="battery capacity, kWh", ylabel="PV array, kWp",
-        cbar_label="equivalent full cycles per day",
-        cmap="magma", fmt=".2f",
-    )
-
-
-def check(frame: pd.DataFrame) -> None:
-    """Reproduce two cells whose answers the earlier grids already fixed."""
-    sources = [
-        ("pv_sizing.csv", 500.0, {"pv_kwp": 1100.0}),
-        ("relative_profitability.csv", 1500.0, {"battery_kwh": 1500.0}),
-    ]
-    print("\ncross-check against the one-dimensional grids")
-    print(f"  {'source':28s} {'cell':22s} {'here':>10s} {'there':>10s} {'diff':>9s}")
-    for filename, kwh, filt in sources:
-        path = RESULTS / filename
-        if not path.exists():
-            print(f"  {filename:28s} not found -- skipped")
-            continue
-        other = pd.read_csv(path)
-        other = other[other["site"] == SITE_NAME]
-        for key, value in filt.items():
-            other = other[other[key] == value]
-        for price in (3.0, 6.0):
-            mine = frame[(frame["pv_kwp"] == 1100.0)
-                         & (frame["battery_kwh"] == kwh)
-                         & (frame["price_EUR_per_kg"] == price)]
-            theirs = other[other["price_EUR_per_kg"] == price]
-            if mine.empty or theirs.empty:
-                continue
-            a = float(mine["operating_EUR_per_day"].iloc[0])
-            b = float(theirs["operating_EUR_per_day"].iloc[0])
-            cell = f"1100 kWp {kwh:.0f} kWh @{price:.0f}"
-            print(f"  {filename:28s} {cell:22s} {a:10.4f} {b:10.4f} "
-                  f"{a - b:+9.4f}")
+    # Trajectories only for the summer runs at each site: enough for the
+    # timeline and commitment figures without storing 36 of them.
+    if season == "summer":
+        SERIES.mkdir(parents=True, exist_ok=True)
+        keep = [c for c in log.columns
+                if c.startswith(("state.", "power.", "enable_", "setpoint_",
+                                 "nmpc_", "bind_", "cf_"))
+                or c in ("pv_available_W", "pv_delivered_W",
+                         "battery_charge_W", "battery_discharge_W")]
+        log[keep].to_csv(
+            SERIES / f"joint_{site_name}_{pv_kwp:.0f}kWp_"
+                     f"{battery_kwh:.0f}kWh_{season}.csv.gz", compression="gzip")
+    return row
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--quick", action="store_true",
-                        help="summer window only, for a fast smoke test")
-    parser.add_argument("--check", action="store_true",
-                        help="compare shared cells against experiments 1 and 2")
-    parser.add_argument("--process-capex", type=float,
-                        default=PROCESS_CAPEX_MULTIPLIER,
-                        help="process-chain capex as a fraction of EUR 2200/kW")
-    args = parser.parse_args()
-
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--days", type=float, default=DAYS)
+    p.add_argument("--sites", nargs="+", default=list(SITES))
+    p.add_argument("--pv", nargs="+", type=float, default=list(PV_KWP))
+    p.add_argument("--batteries", nargs="+", type=float, default=list(BATTERIES))
+    p.add_argument("--seasons", nargs="+", default=list(SEASONS))
+    p.add_argument("--fresh", action="store_true",
+                   help="ignore any existing CSV and start over")
+    args = p.parse_args()
     warnings.filterwarnings("ignore")
-    frame = run(quick=args.quick, process_multiplier=args.process_capex)
 
     RESULTS.mkdir(parents=True, exist_ok=True)
-    out = RESULTS / ("joint_sizing_quick.csv" if args.quick
-                     else "joint_sizing.csv")
-    frame.to_csv(out, index=False)
-    plot(frame)
-    print(f"\nwrote {out}\nwrote {FIGURES}/joint_sizing_*.png")
-    print(f"{SITE_NAME}, process capex at {args.process_capex:.2f}x "
-          f"(EUR {2200.0 * args.process_capex:.0f}/kW)")
+    out = RESULTS / "joint_sizing.csv"
 
-    for price in PANEL_PRICES:
-        sub = frame[frame["price_EUR_per_kg"] == price]
-        best = sub.loc[sub["net_EUR_per_day"].idxmax()]
-        repaid = sub[np.isfinite(sub["payback_years"])]
-        if len(repaid):
-            f = repaid.loc[repaid["payback_years"].idxmin()]
-            line = (f"fastest payback {f['payback_years']:.1f} yr at "
-                    f"{f['pv_kwp']:.0f} kWp / {f['battery_kwh']:.0f} kWh")
-        else:
-            line = "never repaid at any cell"
-        print(f"EUR {price:.2f}/kg   best net {best['net_EUR_per_day']:+.0f} "
-              f"EUR/day at {best['pv_kwp']:.0f} kWp / "
-              f"{best['battery_kwh']:.0f} kWh   |  {line}")
+    # Resume. The first attempt died at cell 23 of 36 -- exit code 4, no
+    # traceback, an abrupt kill rather than a Python error -- after 5.9 hours.
+    # The per-cell CSV write meant nothing was lost, but without this the
+    # restart would have re-run eighteen completed Seville cells to reach the
+    # thirteen missing London ones.
+    rows: list[dict] = []
+    finished: set = set()
+    if out.exists() and not args.fresh:
+        prior = pd.read_csv(out)
+        rows = prior.to_dict("records")
+        finished = set(zip(prior["site"], prior["pv_kwp"].astype(float),
+                           prior["battery_kwh"].astype(float), prior["season"]))
+        print(f"resuming: {len(finished)} cells already in {out.name}",
+              flush=True)
 
-    if args.check and not args.quick:
-        check(frame)
+    total = (len(args.sites) * len(args.pv) * len(args.batteries)
+             * len(args.seasons))
+    print(f"joint sizing: {total} runs, controller EUR {PRICE:.2f}/kg, "
+          f"{args.days:.0f} d, dispatch-nmpc\n", flush=True)
+
+    done, t0 = len(finished), time.perf_counter()
+    for site_name in args.sites:
+        for pv in args.pv:
+            for kwh in args.batteries:
+                for season in args.seasons:
+                    if (site_name, float(pv), float(kwh), season) in finished:
+                        continue
+                    rows.append(one(site_name, SITES[site_name], pv, kwh,
+                                    season, args.days))
+                    done += 1
+                    r = rows[-1]
+                    rate = (time.perf_counter() - t0) / done
+                    print(f"[{done:2d}/{total}] {site_name:8s} {pv:6.0f} kWp "
+                          f"{kwh:6.0f} kWh {season:7s}"
+                          f"  {r['ch4_kg_per_day']:6.1f} kg/d"
+                          f"  trips {r['bus_trips']:5d}"
+                          f"  used {r.get('nmpc_used', float('nan')):.3f}"
+                          f"  {r['wall_s']:5.0f} s"
+                          f"   ({(total - done) * rate / 60:.0f} min left)",
+                          flush=True)
+                    pd.DataFrame(rows).to_csv(out, index=False)
+    print(f"\nwrote {out}  ({time.perf_counter() - t0:.0f} s)")
     return 0
 
 

@@ -59,7 +59,7 @@ params:
       after condensate recycle.
 
   methane_price_per_kg:
-    value: 3.00
+    value: 5.50
     units: EUR/kg
     provenance: assumed
     note: >
@@ -76,26 +76,36 @@ params:
       a number roughly a third of the one it is scored on, and it is
       systematically biased against producing.
 
-      The effect is not subtle. Measured on `dispatch`, 3 days at Seville:
+      The binding comparison is against battery wear. A round trip costs
+      `cost_per_kWh_delivered` = capex / (capacity * DoD_ref * cycle_life * RTE)
+      = EUR 0.0565/kWh at the reference pack, against a night-time shadow price
+      of about EUR 0.043/kWh. Below the crossover the optimiser declines to
+      cycle: it curtails a third of the array, runs the battery flat overnight
+      and trips the bus.
 
-        price     methane     night   curtail    EFC   trips   LCOM
-        1.80     84.4/day    13.6%     33.5%   0.54     522   8.88
-        3.00    132.7/day    31.9%     21.0%   2.06       0   5.89
-        6.16    132.3/day    32.0%     21.5%   2.02       0   5.90
+      **Raised from 3.00 to 5.50 on 17 September 2026.** The 3.00 figure was
+      chosen when the battery wear cost was EUR 0.042/kWh -- just under the
+      shadow price. Correcting the battery economics (DoD-dependent cycle life,
+      and the round-trip efficiency in the denominator) raised the wear cost by
+      35 % to 0.0565, which put 3.00 on the wrong side of the crossover and
+      reproduced the exact failure mode previously documented at 1.80. Measured
+      on `dispatch`, 3 days at Seville under the corrected economics:
 
-      At 1.80 a battery round trip costs EUR 0.042/kWh against a night-time
-      shadow price of EUR 0.043 -- break-even -- so the optimiser declines to
-      cycle, curtails a third of the array, runs the battery flat overnight and
-      trips the bus. Above about EUR 3 that flips and the behaviour saturates,
-      so the exact figure does not matter much; 3.00 is chosen as the low end of
-      the range that works rather than as the LCOM itself, which would be
-      circular.
+        price     methane     night   curtail   trips   LCOM
+        3.00    126.9/day     30.9%     25.7%     243   6.53
+        4.50    138.2/day     33.6%     19.9%     180   6.15
+
+      5.50 sits above the corrected crossover with margin, rather than at the
+      edge of it -- which is what 3.00 turned out to be, and is why a change
+      elsewhere in the model was able to invalidate it silently. The parameter
+      is a control tuning knob, not a forecast, so margin is worth more than
+      precision here.
 
       Caveat: `revenue_EUR`, `marginal_objective_EUR` and `payback_years` all
-      read this parameter, so they now report against a control price rather
-      than a market price and overstate commercial return. LCOM does not -- it
-      is capital over production and is independent of price -- so every
-      controller comparison remains like-for-like.
+      read this parameter, so they report against a control price rather than a
+      market price and overstate commercial return. LCOM does not -- it is
+      capital over production and is independent of price -- so every controller
+      comparison remains like-for-like.
     uncertain: true
     sigma: 0.25
 

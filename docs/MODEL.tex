@@ -1,0 +1,500 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb,booktabs,longtable,microtype}
+\usepackage[hidelinks]{hyperref}
+
+\title{Plant Model: Full Nonlinear Formulation\\and its Linear Approximation}
+\author{Synthetic Fuel Production --- \texttt{sfp}}
+\date{17 September 2026}
+
+\newcommand{\sclip}{\operatorname{sclip}}
+\newcommand{\sstep}{\operatorname{sstep}}
+\newcommand{\gate}{\operatorname{g}}
+
+\begin{document}
+\maketitle
+
+\noindent
+Section~\ref{sec:full} is the model integrated by the simulator and differentiated
+by the inner NMPC --- one set of equations, used by both, so there is no second
+copy to drift. Section~\ref{sec:lp} is the reduced linear model the outer
+dispatch layer optimises. Parameter provenance is tagged in
+\texttt{docs/ASSUMPTIONS.md}; values quoted here are the defaults in
+\texttt{sfp/models/params/*.yaml}. Two thirds of them are \texttt{assumed}.
+
+\section{Full nonlinear model}
+\label{sec:full}
+
+\subsection{Conventions}
+
+The plant state is $x\in\mathbb R^{16}$, the control $u\in\mathbb R^{11}$, and
+weather $w$ carries plane-of-array irradiance $G$ ($\mathrm{W/m^2}$), air temperature
+$T_a$ ($^\circ$C), wind speed $v$ ($\mathrm{m/s}$), relative humidity and
+pressure. Each machine takes a \emph{(setpoint, enable)} pair; the battery takes
+two powers and the array a curtailment fraction.
+
+\textbf{Sign convention: positive electrical power is power \emph{consumed} from
+the DC bus.} The array is therefore a negative load and battery discharge is
+negative.
+
+Three smoothing primitives appear throughout, all from
+\texttt{sfp/models/mathx.py}. They exist because the inner layer differentiates
+these expressions and a hard switch has no usable gradient:
+\begin{align}
+\sstep(z;\varepsilon) &= \tfrac12\bigl(1+\tanh(z/\varepsilon)\bigr), &
+\sclip(z;a,b,\varepsilon) &\approx \min(\max(z,a),b).
+\end{align}
+Every machine is gated by $\gate(u) = \sstep(u_{\text{enable}}-\tfrac12;\,0.05)$,
+which is $2.06\times10^{-9}$ when off and $1$ when on. Integration is fixed-step
+RK4 with a zero-order hold on $u$ and $w$.
+
+\subsection{PV array}
+
+No states. Input: curtailment fraction $\gamma\in[0,1]$.
+
+Faiman (2008) cell temperature, linear temperature derating about STC, constant
+inverter efficiency and a hard clip at the AC rating:
+\begin{align}
+T_{\text{cell}} &= T_a + \frac{G}{u_0 + u_1 v}, &
+f_{\text{derate}} &= (1-s)(1-\ell)(1-d)^{y},\\
+P_{\text{dc}} &= P_{\text{dc}}^{\text{rated}}\,\frac{G}{G_{\text{ref}}}
+  \bigl(1+\gamma_P (T_{\text{cell}}-T_{\text{ref}})\bigr) f_{\text{derate}}, &
+P_{\text{ac}} &= \min\!\bigl(\eta_{\text{inv}} P_{\text{dc}},\, P_{\text{ac}}^{\text{rated}}\bigr),
+\end{align}
+with $P_{\text{ac}}^{\text{rated}} = P_{\text{dc}}^{\text{rated}}/\text{DC:AC}$
+and delivered power $(1-\gamma)P_{\text{ac}}$. Clipping loss and deliberate
+curtailment are reported separately --- the brief asks for curtailment, and off
+grid it is simply PV that cannot be absorbed.
+
+\begin{center}\small
+\begin{tabular}{llr}
+\toprule
+$\gamma_P$ & power temperature coefficient & $-0.0035\ \mathrm{K^{-1}}$\\
+$T_{\text{ref}}, G_{\text{ref}}$ & STC reference & $25\,^\circ$C, $1000\ \mathrm{W/m^2}$\\
+$u_0, u_1$ & Faiman coefficients & $25\ \mathrm{W/(m^2K)}$, $6.84\ \mathrm{Ws/(m^3K)}$\\
+$\eta_{\text{inv}}$, DC:AC & inverter & $0.975$, $1.25$\\
+$s,\ \ell,\ d$ & soiling, wiring, annual degradation & $0.03,\ 0.02,\ 0.005\ \mathrm{yr^{-1}}$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Battery}
+
+States: state of charge $\sigma$, fractional capacity fade $\phi$, cumulative
+equivalent full cycles $n$. Inputs: charge and discharge power, both
+non-negative.
+\begin{align}
+E_{\text{use}} &= E_{\text{nom}}\max(1-\phi,\,10^{-3}), &
+\dot\sigma &= \frac{\eta_c P_{\text{ch}} - P_{\text{dis}}/\eta_d}{E_{\text{use}}}
+   - \frac{\kappa_{\text{sd}}}{86400}\,\sigma,\\
+\dot n &= \frac{P_{\text{ch}}+P_{\text{dis}}}{2E_{\text{nom}}}, &
+\dot\phi &= \frac{\phi_{\text{eol}}}{N_{\text{cyc}}}\,S(\sigma)\,\dot n
+   + \frac{\phi_{\text{cal}}}{T_{\text{yr}}} .
+\end{align}
+
+Charge and discharge are \emph{separate non-negative} variables rather than one
+signed power. Nothing forbids both being positive at once; what prevents it is
+that the wear term makes it strictly worse than either alone, which is how this
+formulation avoids an explicit complementarity constraint.
+
+The depth-of-discharge stress factor $S$ encodes
+$N(\mathrm{DoD}) = N_{\text{ref}}(\mathrm{DoD}_{\text{ref}}/\mathrm{DoD})^{k}$:
+\begin{equation}
+S(\sigma) = C\,\Bigl[\max\bigl(\underbrace{2|\sigma-\bar\sigma|/\mathrm{DoD}_{\text{ref}}}_{\text{depth}},\ f_{\min}\bigr)\Bigr]^{k-1},
+\qquad \bar\sigma=\tfrac12(\sigma_{\max}+\sigma_{\min}),
+\end{equation}
+with $C$ chosen so a cycle at the rated depth costs exactly one rated cycle.
+\textbf{This is a local proxy for a path-dependent quantity}: depth of discharge
+is properly a property of a \emph{cycle}, recovered by rainflow counting, and a
+differential model cannot see a cycle. Without it, throughput is all that
+matters and a large pack swinging gently is charged the same per kWh as a small
+one cycling to its limits --- which flatters small packs precisely in a sizing
+sweep.
+
+\begin{center}\small
+\begin{tabular}{llr}
+\toprule
+$\eta_c,\eta_d$ & one-way efficiencies & $0.96$, $0.96$\\
+$\sigma_{\min},\sigma_{\max}$ & SoC window & $0.10$, $0.95$\\
+$\kappa_{\text{sd}}$ & self-discharge & $0.002\ \mathrm{d^{-1}}$\\
+$N_{\text{cyc}}$, $\mathrm{DoD}_{\text{ref}}$ & rated cycle life & $6000$ at $0.80$\\
+$k$, $f_{\min}$ & DoD exponent, stress floor & $3.0$, $0.25$\\
+$\phi_{\text{eol}}$, $\phi_{\text{cal}}$ & end-of-life fade, calendar fade & $0.20$, $0.015\ \mathrm{yr^{-1}}$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Air contactor}
+
+No states --- the sorbent it loads lives in \S\ref{sub:solids}. Input: airflow
+fraction $\varphi$ and enable.
+
+Capture and fan power scale oppositely with airflow, which is the whole point of
+the subsystem:
+\begin{align}
+V &= \varphi\,\gate(u)\,V_{\max}, &
+\rho &= \frac{p}{R T_a}, &
+\mathrm{NTU} &= \mathrm{NTU}_{\text{d}}\frac{V_{\text{d}}}{\max(V,10^{-3})},\\
+\eta_{\text{cap}} &= 1-e^{-\mathrm{NTU}}, &
+f_T &= \exp\!\Bigl[-\frac{E_a}{R}\Bigl(\frac1{T_a}-\frac1{T_{\text{ref}}}\Bigr)\Bigr], &
+f_{\mathrm{RH}} &= \frac{\mathrm{rh}/(\mathrm{rh}+k_h)}{\mathrm{rh}_{\text{ref}}/(\mathrm{rh}_{\text{ref}}+k_h)},
+\end{align}
+\begin{equation}
+r_{\text{carb}} = V\rho\,y_{\mathrm{CO_2}}\,\eta_{\text{cap}}\,f_T\,f_{\mathrm{RH}}\,f_{\text{load}},
+\qquad
+P_{\text{fan}} = P_{\text{fan}}^{\text{rated}}\varphi^{3} + P_{\text{idle}}\gate(u).
+\end{equation}
+$\mathrm{NTU}_{\text{d}} = -\ln(1-\eta_{\text{d}})$; residence time falls as
+$1/V$ in a fixed bed, so $\mathrm{NTU}\propto 1/V$. The load taper
+$f_{\text{load}} = \sclip\bigl((1-L)/(1-L_{\text{taper}})\bigr)$ stops the fan
+pushing CO$_2$ into a saturated bed.
+
+\textbf{Diminishing returns are severe.} At reference sizing, $20^\circ$C and
+60\,\% RH: $60\,\%$ flow captures $0.233$\,mol/s for $4.7$\,kW
+($128\ \mathrm{kWh/tCO_2}$); $100\,\%$ flow captures $0.279$\,mol/s for
+$20.4$\,kW ($462\ \mathrm{kWh/tCO_2}$). Twenty percent more CO$_2$ for four and
+a third times the fan power --- a power-follow controller that dumps surplus
+solar into the fans burns most of it for nothing.
+
+\begin{center}\small
+\begin{tabular}{llr}
+\toprule
+$V_{\max}$, $V_{\text{d}}$ & max and design airflow & $40$, $24\ \mathrm{m^3/s}$\\
+$\eta_{\text{d}}$ & design single-pass capture & $0.65$\\
+$P_{\text{fan}}^{\text{rated}}$, $P_{\text{idle}}$ & fan power & $20$\,kW, $0.4$\,kW\\
+$y_{\mathrm{CO_2}}$ & ambient mole fraction & $420$\,ppm (measured)\\
+$E_a$, $k_h$, $L_{\text{taper}}$ & activation, RH half-sat., taper & $20$\,kJ/mol, $0.3$, $0.9$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Sorbent inventory}
+\label{sub:solids}
+
+States: $n_{\mathrm{CaO}}$, $n_{\mathrm{CaCO_3}}$, mean cycle number $\bar N$.
+No inputs --- it is driven by the contactor and calciner rates.
+\begin{align}
+\dot n_{\mathrm{CaO}} &= r_{\text{calc}} - r_{\text{carb}} + \dot m - \pi r_{\text{calc}}, &
+\dot n_{\mathrm{CaCO_3}} &= r_{\text{carb}} - r_{\text{calc}}, &
+\dot{\bar N} &= \frac{r_{\text{calc}} - \dot m \bar N}{n_{\text{tot}}} .
+\end{align}
+One full pass of the inventory through the kiln advances $\bar N$ by exactly one;
+make-up dilutes the mean age. Grasa--Abanades deactivation sets the capacity:
+\begin{equation}
+X(\bar N) = \frac{1}{k\bar N + (1-X_r)^{-1}} + X_r,
+\qquad X_r = 0.075,\ k = 0.52 .
+\end{equation}
+$\bar N$ is kept \emph{continuous} rather than integer specifically so it stays
+differentiable inside the NLP. Because $\mathrm{d}X/\mathrm{d}\bar N<0$, every
+calcination permanently shrinks the capacity of the \emph{whole} inventory ---
+the marginal cost the controller pays per mole calcined, and the reason it is
+reluctant to cycle the loop harder than the methane is worth.
+
+$n_{\text{tot}} = 50\,000$\,mol; make-up and purge are both zero by default, so
+deactivation is irreversible in the runs reported.
+
+\subsection{Calciner}
+
+State: kiln temperature $T$. Inputs: heater fraction and enable.
+
+Three independent limits multiply --- thermodynamics, kinetics, feedstock:
+\begin{align}
+p_{\text{eq}}(T) &= A_B e^{-B_B/T} \quad\text{(Baker 1962)}, &
+f_{\text{drive}} &= \sclip\!\Bigl(1-\frac{p_{\text{op}}}{p_{\text{eq}}}\Bigr), \\
+f_{\text{kin}} &= A_k e^{-E_a/(RT)}, &
+f_{\text{feed}} &= \sclip\!\Bigl(\frac{n_{\mathrm{CaCO_3}}}{n_{\text{ref}}}\Bigr),
+\end{align}
+\begin{equation}
+r_{\text{calc}} = r_{\max}\,f_{\text{drive}}\,\sclip(f_{\text{kin}})\,f_{\text{feed}}\,\gate(u).
+\end{equation}
+Energy balance, with all four terms in watts:
+\begin{equation}
+C\,\dot T = \underbrace{f_h P_h^{\text{rated}}\eta_h}_{\text{heater}}
+ - \underbrace{(UA + c_v v)(T-T_a)}_{\text{loss}}
+ - \underbrace{r_{\text{calc}}\,\Delta H_{\text{calc}}}_{\text{reaction}}
+ - \underbrace{r_{\text{calc}} M_{\mathrm{CaCO_3}} c_p \max(T-T_{\text{feed}},0)}_{\text{sensible}} .
+\end{equation}
+The heater fraction carries an over-temperature interlock. \textbf{The kiln's
+thermal inertia is the plant's commitment problem}: $C = 3\times10^6$\,J/K
+against a 150\,kW heater means \textbf{5.6 hours from ambient to 1200\,K}, so a
+kiln worth lighting is a kiln worth running for a while. That single fact is why
+the outer layer keeps a kiln temperature state at all.
+
+\begin{center}\small
+\begin{tabular}{llr}
+\toprule
+$C$, $P_h^{\text{rated}}$, $\eta_h$ & thermal capacity, heater & $3.0\times10^6$\,J/K, $150$\,kW, $0.95$\\
+$UA$, $c_v$ & loss coefficient, wind term & $17\ \mathrm{W/K}$, $0.6\ \mathrm{W/(K\,m/s)}$\\
+$A_B$, $B_B$ & Baker equilibrium & $4.137\times10^7$\,atm, $20474$\,K\\
+$p_{\text{op}}$ & kiln operating pressure & $0.3$\,atm\\
+$A_k$, $E_a$ & Arrhenius & $2.207\times10^5\ \mathrm{s^{-1}}$, $120$\,kJ/mol\\
+$r_{\max}$, $T_{\max}$ & feeder throughput, limit & $0.45$\,mol/s, $1273$\,K\\
+$\Delta H_{\text{calc}}$ & endothermic & $+178$\,kJ/mol\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{PEM electrolyser}
+
+States: stack temperature $T$, voltage degradation $\delta V$. Input: current
+fraction and enable. $i = \varphi\,\gate(u)\,i_{\max}$.
+\begin{align}
+V_{\text{rev}}(T) &= V_{\text{rev}}^0 + \alpha_T (T-298.15), &
+\eta_{\text{act}} &= \frac{RT}{\alpha_c F}\,\operatorname{asinh}\!\Bigl(\frac{i}{2i_0}\Bigr),\\
+\mathrm{ASR}(T) &= \mathrm{ASR}_0\bigl(1+\beta(T-T_{\text{set}})\bigr), &
+V_{\text{cell}} &= V_{\text{rev}} + \eta_{\text{act}} + i\,\mathrm{ASR} + \delta V .
+\end{align}
+The activation term is Butler--Volmer in $\operatorname{asinh}$ form, which is
+exact and---unlike the Tafel approximation---smooth down to zero current.
+\begin{align}
+r_{\mathrm{H_2}} &= \frac{\eta_F N_c i A}{2F}, &
+P_{\text{stack}} &= N_c V_{\text{cell}} i A, &
+Q_{\text{gen}} &= N_c i A (V_{\text{cell}} - V_{\text{tn}}),\\
+P_{\text{total}} &= P_{\text{stack}} + P_{\text{aux}}\gate(u) + \kappa Q_{\text{gen}}, &
+C\dot T &= Q_{\text{gen}} - Q_{\text{cool}} - UA(T-T_a), &
+\dot{\delta V} &= \delta_r \varphi .
+\end{align}
+Heat is written as the voltage difference $V_{\text{cell}}-V_{\text{tn}}$ rather
+than (electrical in $-$ chemical out), to avoid differencing two large, nearly
+equal numbers.
+
+\textbf{Efficiency peaks at part load and then falls}, because $\eta_{\text{act}}$
+grows like $\log i$ while the ohmic term grows like $i$. ``Run flat out when
+sunny'' is therefore provably suboptimal --- one of the few places where the
+economics and the physics point the same way.
+
+\begin{center}\small
+\begin{tabular}{llr}
+\toprule
+$N_c$, $A$, $i_{\max}$ & cells, area, max current density & $105$, $1000\ \mathrm{cm^2}$, $1.5\ \mathrm{A/cm^2}$\\
+$i_{\min}$ & minimum load (gas crossover) & $0.10\,i_{\max}$\\
+$V_{\text{rev}}^0$, $V_{\text{tn}}$, $\alpha_T$ & reversible, thermoneutral & $1.229$\,V, $1.481$\,V, $-0.9$\,mV/K\\
+$i_0$, $\alpha_c$, $\mathrm{ASR}_0$, $\beta$ & kinetics, resistance & $10^{-4}\ \mathrm{A/cm^2}$, $0.5$, $0.15\ \Omega\mathrm{cm^2}$, $-0.005\ \mathrm{K^{-1}}$\\
+$\eta_F$, $P_{\text{aux}}$, $\kappa$ & Faraday eff., auxiliaries, parasitic & $0.98$, $15$\,kW, $0.02$\\
+$C$, $UA$, $T_{\max}$ & thermal & $2.5\times10^5$\,J/K, $150$\,W/K, $353.15$\,K\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Gas buffers and water balance}
+
+Hydrogen and CO$_2$ tanks, no inputs:
+\begin{equation}
+\dot n_{\mathrm{H_2}} = a_{\mathrm{H_2}} r_{\text{ely}} - 4 r_{\text{sab}},
+\qquad
+\dot n_{\mathrm{CO_2}} = a_{\mathrm{CO_2}} r_{\text{calc}} - r_{\text{sab}},
+\end{equation}
+where $a_\bullet\in[0,1]$ are smooth acceptance gates that close as a tank fills.
+Production the tanks cannot accept is \emph{vented and recorded}, not silently
+dropped from the mass balance: a power-follow controller can vent nearly half the
+hydrogen it makes, having paid ${\sim}56$\,kWh/kg for it, purely because it never
+looked at the tank level.
+
+Water, with condensate recycle $\phi_r = 0.95$:
+\begin{equation}
+\dot m_{w} = \dot m_{\text{makeup}} + 2\phi_r M_{\mathrm{H_2O}} r_{\text{sab}} - M_{\mathrm{H_2O}} r_{\text{ely}} .
+\end{equation}
+Net consumption is ${\approx}2.25$\,kg H$_2$O per kg CH$_4$ after recycle --- a
+real constraint at an arid site. Capacities: $30\,000$\,mol H$_2$,
+$6000$\,mol CO$_2$, $5000$\,kg water; CO$_2$ compression costs $17.5$\,kJ/mol.
+
+\subsection{Sabatier reactor}
+
+States: temperature $T$, catalyst activity $a$, cumulative methane $m$. Input:
+feed fraction $\varphi$ and enable.
+\begin{align}
+X_{\text{eq}}(T) &= \frac{1}{1+\exp\bigl((T-T_{50})/w\bigr)}, &
+\mathrm{Da} &= \mathrm{Da}_{\text{ref}}\,e^{-\frac{E_a}{R}(\frac1T-\frac1{T_{\text{ref}}})}\,\frac{a}{\max(\varphi,0.02)},\\
+X &= X_{\text{eq}}\bigl(1-e^{-\mathrm{Da}}\bigr), &
+r_{\text{sab}} &= \varphi F_{\max} X \, \Lambda(w).
+\end{align}
+$X_{\text{eq}}$ \emph{falls} with temperature because the reaction is
+exothermic; that is the term that stops the controller running the reactor as
+hot as the catalyst allows. Residence time rises as the feed is turned down, so
+$\mathrm{Da}$ rises --- conversion improves at part load.
+
+The availability factor is the hard stoichiometric coupling:
+\begin{equation}
+\Lambda = \min\!\Bigl(\sclip\bigl(\tfrac{n_{\mathrm{CO_2}}}{50}\bigr),\,
+                      \sclip\bigl(\tfrac{n_{\mathrm{H_2}}}{200}\bigr)\Bigr)\cdot\sstep(m_w-1).
+\end{equation}
+\textbf{Whichever of CO$_2$ or H$_2$ runs short throttles the reactor, no matter
+how much of the other is banked.} This is what forces the two upstream chains to
+be co-scheduled rather than optimised separately, and it is the single most
+important coupling in the plant.
+\begin{align}
+C\dot T &= r_{\text{sab}}(-\Delta H) + Q_{\text{pre}} - Q_{\text{cool}} - UA(T-T_a) - Q_{\text{sens}}, \\
+\dot a &= -k_d \exp\!\Bigl(\frac{T-T_{\text{ref}}^d}{T_{\text{scale}}}\Bigr) a,
+\qquad \dot m = r_{\text{sab}} M_{\mathrm{CH_4}} .
+\end{align}
+Deactivation is exponential in temperature, so thermal excursions are
+permanently expensive.
+
+\begin{center}\small
+\begin{tabular}{llr}
+\toprule
+$F_{\max}$ & max CO$_2$ feed & $0.12$\,mol/s\\
+$T_{50}$, $w$ & equilibrium logistic & $810$\,K, $70$\,K\\
+$\mathrm{Da}_{\text{ref}}$, $E_a$ & kinetics at $573$\,K & $6.0$, $80$\,kJ/mol\\
+$T_{\text{ign}}$, $T_{\text{target}}$, $T_{\max}$ & light-off, target, sintering & $523$, $573$, $823$\,K\\
+$k_d$, $T_{\text{scale}}$ & deactivation & $10^{-8}\ \mathrm{s^{-1}}$, $50$\,K\\
+$\Delta H$ & exothermic & $-165$\,kJ/mol\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{DC bus}
+
+The subsystems are coupled only through the power balance, evaluated in
+registration order so that each publishes what the next needs:
+\begin{equation}
+\underbrace{P_{\text{fan}} + P_{\text{kiln}} + P_{\text{ely}} + P_{\text{sab}}
+ + w_{\text{comp}} r_{\text{calc}}}_{\text{loads}}
+ + \underbrace{P_{\text{ch}} - P_{\text{dis}}}_{\text{battery}}
+ - \underbrace{(1-\gamma)P_{\text{ac}}}_{\text{array}} = 0 .
+\end{equation}
+A regulatory layer below the controller enforces this in the real plant: it caps
+PV and battery to what the hardware can deliver and, when demand still exceeds
+supply, \textbf{sheds load in a fixed priority order} --- calciner, contactor,
+electrolyser, Sabatier --- recording every intervention and every undervoltage
+trip. A controller that needs the bus to save it is failing.
+
+\section{Linear approximation for the dispatch LP}
+\label{sec:lp}
+
+The outer layer is a MILP over $n = 240$ hourly intervals: 7447 columns, 6964
+rows, 24 integers. It carries \emph{all} the economics and, apart from the kiln,
+no dynamics. See \texttt{docs/DISPATCH\_NMPC.md} \S2 for the row census.
+
+\subsection{What is dropped, and what that costs}
+
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Full model} & \textbf{LP treatment} & \textbf{Consequence}\\
+\midrule
+16 states & 7 states & fast thermal states invisible\\
+$\eta_{\text{cap}}(V)$, $\eta_{\text{act}}(i)$, $X(T)$ & concave PWL in dispatch & exact relaxation (\S\ref{sub:pwl})\\
+reactor $T$, electrolyser $T$ & dropped & light-off and warm-up unmodelled\\
+kiln $T$ & \textbf{kept} --- balance is linear & 5.6\,h warm-up preserved\\
+$r_{\text{calc}}(T)$ Arrhenius$\times$Baker & linear bound + binary & genuinely non-convex (\S\ref{sub:kiln})\\
+catalyst, stack degradation & dropped & no thermal-cycling cost\\
+hourly grid & --- & \textbf{sub-hourly buffering invisible}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The last line is not a rounding error. Measured closed-loop, the LP's planned
+operating profit is flat across a $15\times$ range of battery capacity while
+realised profit rises $2.5\times$: an hourly average of supply and demand simply
+does not contain the deficits a battery exists to cover, so the layer cannot
+price storage. See \texttt{experiments/BATTERY\_SIZING.md}.
+
+\subsection{States and controls}
+
+$z_k\in\mathbb R^7 = (\sigma,\ n_{\mathrm{CaCO_3}},\ \bar N,\ n_{\mathrm{H_2}},\
+n_{\mathrm{CO_2}},\ m_w,\ T_{\text{kiln}})$; 24 columns per interval: four
+commitments $e_j$, seven PWL segment fills, kiln power/rate/indicator, four start
+indicators, two battery powers, curtailment, two vent rates and make-up water.
+
+\subsection{Piecewise-linear rate maps}
+\label{sub:pwl}
+
+For the contactor, electrolyser and reactor, each nonlinear rate curve is
+replaced by segment fills $\delta_{j,m}\in[0,w_{j,m}]$:
+\begin{equation}
+d_j = \sum_m \delta_{j,m}, \qquad r_j = \sum_m a_{j,m}\delta_{j,m},
+\qquad \delta_{j,m} \le w_{j,m} e_j ,
+\end{equation}
+with slopes $a_{j,m}$ \textbf{strictly decreasing}. That concavity is what makes
+the relaxation \emph{exact}: an optimiser maximising output fills the steepest
+segment first unprompted, so no ordering binaries are needed. The builder raises
+if a sampled curve is not concave --- without it the formulation is silently
+wrong rather than merely approximate. Electrical draw is
+$P_j = \text{idle}_j e_j + d_j$ for the power-dispatched machines.
+
+\subsection{Kiln: the one irreducible binary}
+\label{sub:kiln}
+
+The energy balance is linear exactly as written in the full model, with the
+sensible-heat term evaluated at the operating temperature rather than at $T_k$
+--- the only approximation, worth a few percent of duty during warm-up:
+\begin{equation}
+C\frac{T_{k+1}-T_k}{\Delta t} = \eta P^{\text{kiln}}_k - UA(T_k - T_a) - \Delta H\,r^{\text{cal}}_k .
+\end{equation}
+The \emph{rate} is the problem. The set
+$0 \le r \le \max\bigl(0,\ \alpha(T-T_{\text{on}})\bigr)$ is genuinely
+non-convex, and writing the cap directly rearranges to
+$T \ge T_{\text{on}} + r/\alpha$, which at $r=0$ demands a permanently hot kiln.
+An indicator is unavoidable:
+\begin{equation}
+r \le \bar r y, \qquad
+r \le \alpha(T-T_{\text{on}}) + M(1-y), \qquad
+y \le e, \qquad M = \alpha(T_{\text{on}}-250).
+\end{equation}
+Relaxing $y$ to $[0,1]$ permits
+$r^\star = \bar r(\alpha(T-T_{\text{on}})+M)/(\bar r+M)$, which at 841\,K allows
+$0.26$\,mol/s where the real kiln calcines nothing --- and reproduces exactly the
+failure it was added to prevent: calcination scheduled on a cold kiln, sorbent
+saturation, production collapsing to 17\,kg/day. $y$ is therefore binary over the
+first 24 hours and relaxed beyond, where only the terminal inventory depends on
+it.
+
+\subsection{Dynamics}
+
+Seven equalities per interval, all linear:
+\begin{align}
+\sigma_{k+1} &= \sigma_k\Bigl(1-\tfrac{\Delta t\,\kappa_{\text{sd}}}{86400}\Bigr)
+  + \tfrac{\Delta t\,\eta_c P^{\text{ch}}_k}{E} - \tfrac{\Delta t\,P^{\text{dis}}_k}{\eta_d E}, &
+n^{\mathrm{CaCO_3}}_{k+1} &= n^{\mathrm{CaCO_3}}_k + \Delta t(r^{\text{cont}}_k - r^{\text{cal}}_k),\\
+\bar N_{k+1} &= \bar N_k + \Delta t\,r^{\text{cal}}_k/n_{\text{tot}}, &
+n^{\mathrm{H_2}}_{k+1} &= n^{\mathrm{H_2}}_k + \Delta t(r^{\text{ely}}_k - 4r^{\text{sab}}_k - v^{\mathrm{H_2}}_k),\\
+n^{\mathrm{CO_2}}_{k+1} &= n^{\mathrm{CO_2}}_k + \Delta t(r^{\text{cal}}_k - r^{\text{sab}}_k - v^{\mathrm{CO_2}}_k), &
+m^w_{k+1} &= m^w_k + \Delta t(\dot m^w_k + 2\phi_r M r^{\text{sab}}_k - M r^{\text{ely}}_k).
+\end{align}
+
+\subsection{Remaining constraints}
+
+\textbf{Bus balance} (the block whose dual is $\lambda$), written
+demand-minus-supply so relaxing it means energy from nowhere and the dual is a
+positive price:
+$\sum_j P_{j,k} + w_{\text{comp}} r^{\text{cal}}_k + P^{\text{ch}}_k - P^{\text{dis}}_k = (1-\gamma_k)\mathrm{PV}_k$.
+
+\textbf{Reactor availability}, a linear envelope of the plant's $\min(\cdot,\cdot)$
+taper --- needing no indicator, because the taper reaches zero exactly \emph{at}
+the box floor so $r^{\text{sab}}=0$ stays feasible:
+\begin{equation}
+r^{\text{sab}}_k \le \bar r_{\text{sab}}\frac{n^{\mathrm{CO_2}}_k-\underline n_{\mathrm{CO_2}}}{50},
+\qquad
+r^{\text{sab}}_k \le \bar r_{\text{sab}}\frac{n^{\mathrm{H_2}}_k-\underline n_{\mathrm{H_2}}}{200}.
+\end{equation}
+
+\textbf{Commitment}: minimum electrolyser load
+$\sum_m \delta_{\text{ely},m,k}\ge \underline d\,e_k$; start counting
+$s_{j,k}\ge e_{j,k}-e_{j,k-1}$, with interval 0 measured against what is
+\emph{already running} rather than against zero; and minimum up-time
+$\tau_j s_{j,k}\le\sum_{l=k}^{k+\tau_j-1}e_{j,l}$ with $\tau=3$ for the calciner
+and $2$ for the reactor.
+
+\subsection{Objective}
+
+\begin{equation}
+\min \sum_{k}\Bigl[-p_{\mathrm{CH_4}}M_{\mathrm{CH_4}}\Delta t\,r^{\text{sab}}_k
++ \frac{c_{\text{sorb}}\Delta t\,r^{\text{cal}}_k}{n_{\text{tot}}}
++ \frac{c_{\text{batt}}\Delta t}{2E}(P^{\text{ch}}_k+P^{\text{dis}}_k)
++ c_w\Delta t\,\dot m^w_k
++ \sum_j c^{\text{start}}_j s_{j,k}\Bigr] - V(z_n),
+\end{equation}
+with start costs $0.50/40/5/40$\,EUR for contactor/calciner/electrolyser/reactor
+and terminal value $V$ pricing leftover inventory at the methane it would become.
+Without $V$ the layer empties every buffer at the horizon end, which is locally
+optimal and globally wrong.
+
+$c_{\text{batt}} = \mathrm{CAPEX}/(E\cdot\mathrm{DoD}_{\text{ref}}\cdot N_{\text{cyc}}\cdot\eta_{\text{rt}})$
+$= 0.0565$\,EUR/kWh at the reference pack, against a night-time shadow price of
+${\approx}0.043$\,EUR/kWh. \textbf{$p_{\mathrm{CH_4}}$ is a control tuning
+parameter, not a market price}: set below the crossover the optimiser declines
+to cycle the battery, curtails a third of the array, runs the pack flat and trips
+the bus. It is fixed at $5.50$\,EUR/kg, above the crossover with margin.
+
+\end{document}

@@ -205,7 +205,12 @@ class EconomicPlanner(Controller):
         self.backend = (
             self._backend_spec
             if isinstance(self._backend_spec, SolverBackend)
-            else get_backend(self._backend_spec, max_iter=self.max_iter,
+            # `expand=False`: this horizon is two orders larger than the inner
+            # NMPC's, where SX expansion measured 2.4x faster. Expansion cost
+            # and memory both grow with the graph and the trade has not been
+            # measured at this size, so the legacy planner keeps MX.
+            else get_backend(self._backend_spec, expand=False,
+                             max_iter=self.max_iter,
                              tol=self.tol, acceptable_tol=self.tol * 100.0)
         )
         self.plan = None

@@ -209,6 +209,14 @@ class EconomicDispatch(Controller):
         #: ever implemented, so 24 is a wide margin over what is needed.
         binary_horizon_hours: int = 24,
         time_limit_s: float = 120.0,
+        #: Recover lambda from the MILP. **Off by default: nothing reads it.**
+        #: The inner NMPC accepts `prices` and discards it in both objective
+        #: modes, and the proposed safety filter has no economics at all, so the
+        #: price survives only as a reported diagnostic. Recovering it costs a
+        #: second LP solve on every replan -- the integers fixed and the
+        #: continuous problem re-solved -- which is real time in a sweep that
+        #: never looks at the answer. Turn it on for a reporting run.
+        recover_duals: bool = False,
         name: str | None = None,
     ) -> None:
         self.horizon_hours = int(horizon_hours)
@@ -217,6 +225,7 @@ class EconomicDispatch(Controller):
         self.commit_threshold = float(commit_threshold)
         self.binary_horizon_hours = int(binary_horizon_hours)
         self.time_limit_s = float(time_limit_s)
+        self.recover_duals = bool(recover_duals)
         if name:
             self.name = name
 
@@ -342,7 +351,8 @@ class EconomicDispatch(Controller):
         kiln = model.thermal()
 
         problem, layout = self._build(n, z0, rows, pwl, kiln)
-        solution = solve_lp(problem, time_limit_s=self.time_limit_s)
+        solution = solve_lp(problem, time_limit_s=self.time_limit_s,
+                            duals=self.recover_duals)
         self._solves += 1
 
         if not solution.success:

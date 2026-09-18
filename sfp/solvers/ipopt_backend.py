@@ -45,12 +45,28 @@ class IpoptBackend(SolverBackend):
         acceptable_tol: float = 1e-4,
         print_level: int = 0,
         warm_start: bool = False,
+        #: Convert the problem to CasADi's scalar (SX) graph before solving.
+        #:
+        #: An MX graph is evaluated node by node through CasADi's interpreter
+        #: with matrix-valued operations; SX is scalar-level and lets CasADi
+        #: optimise the expression and its derivatives properly. Measured on the
+        #: inner filter, ten busy states: **1.211 s -> 0.506 s per solve** at
+        #: identical iteration counts, with the resulting control identical to
+        #: 3e-16. The whole saving is evaluation speed, not convergence.
+        #:
+        #: It is not free at construction -- expansion costs 0.307 s against
+        #: 0.033 s for MX, paid on every build -- and the memory it needs grows
+        #: with the graph, so a very large problem can expand badly or not at
+        #: all. That is why `EconomicPlanner` opts out: its 240-step horizon is
+        #: two orders larger than the inner NMPC's and the trade has not been
+        #: measured there.
+        expand: bool = True,
         linear_solver: str | None = None,
         **options,
     ) -> None:
         super().__init__(
             max_iter=max_iter, tol=tol, acceptable_tol=acceptable_tol,
-            print_level=print_level, warm_start=warm_start,
+            print_level=print_level, warm_start=warm_start, expand=expand,
             linear_solver=linear_solver, **options,
         )
         #: one-entry solver cache: (nlp, solver). See `_solver_for`.
@@ -76,9 +92,10 @@ class IpoptBackend(SolverBackend):
             )
         extra = {k: v for k, v in o.items()
                  if k not in {"max_iter", "tol", "acceptable_tol", "print_level",
-                              "warm_start", "linear_solver"}}
+                              "warm_start", "linear_solver", "expand"}}
         ipopt.update(extra)
-        return {"ipopt": ipopt, "print_time": False}
+        return {"ipopt": ipopt, "print_time": False,
+                "expand": bool(o.get("expand", True))}
 
     def _solver_for(self, nlp: NLP) -> ca.Function:
         """Build (once per problem structure) the CasADi solver object.

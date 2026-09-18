@@ -210,6 +210,16 @@ def simulate(
         record["pv_delivered_W"] = dispatch.pv_used_W
         record["pv_power_W"] = -dispatch.pv_used_W
         record["power.pv"] = -dispatch.pv_used_W
+        # The battery needs the same correction and for the same reason, and it
+        # is easier to miss: `power.pv` collides with a settled value so the
+        # omission is obvious, whereas the bus publishes `power.battery` and the
+        # dispatch publishes `battery_charge_W`/`battery_discharge_W` under
+        # different names, so nothing overwrote it. The bus evaluates the plant
+        # with no battery dispatch, which means **`power.battery` was
+        # identically zero in every log ever written** -- silently, since a
+        # plotted zero looks like an idle pack rather than a missing column.
+        record["power.battery"] = (dispatch.battery_charge_W
+                                   - dispatch.battery_discharge_W)
         record.update({f"state.{n}": v for n, v in zip(plant.state_names(), x)})
         record.update(controller.diagnostics())
         records.append(record)
